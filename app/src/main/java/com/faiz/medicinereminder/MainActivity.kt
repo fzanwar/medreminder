@@ -183,13 +183,16 @@ object Scheduler {
         return cal.timeInMillis
     }
 
+    // Alarm-clock type alarms are exempt from battery saving (Doze), so they fire on time.
     fun setAlarm(c: Context, id: Int, idx: Int, at: Long, snooze: Boolean) {
         val a = am(c)
         val p = pi(c, id, idx, snooze)
-        val exact = Build.VERSION.SDK_INT < 31 || a.canScheduleExactAlarms()
+        val show = PendingIntent.getActivity(
+            c, 1, Intent(c, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         try {
-            if (exact) a.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
-            else a.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
+            a.setAlarmClock(AlarmManager.AlarmClockInfo(at, show), p)
         } catch (_: SecurityException) {
             a.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
         }
