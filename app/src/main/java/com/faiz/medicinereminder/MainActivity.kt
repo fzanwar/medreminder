@@ -17,6 +17,8 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.Icon
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -24,6 +26,7 @@ import android.provider.Settings
 import android.view.Gravity
 import android.view.ViewGroup
 import android.view.WindowInsets
+import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
@@ -80,6 +83,28 @@ object Store {
         prefs(c).edit().putString("meds", arr.toString()).apply()
     }
 
+    private fun today() = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(java.util.Date())
+
+    // Today's record per dose: "T" = taken, "S" = skipped (not taking).
+    fun setStatus(c: Context, id: Int, idx: Int, st: String) {
+        val p = prefs(c)
+        val o = try { JSONObject(p.getString("log", "{}")) } catch (_: Exception) { JSONObject() }
+        val ks = mutableListOf<String>()
+        val iter = o.keys()
+        while (iter.hasNext()) ks.add(iter.next())
+        ks.filter { !it.startsWith(today()) }.forEach { o.remove(it) }
+        o.put("${today()}:$id:$idx", st)
+        p.edit().putString("log", o.toString()).apply()
+    }
+
+    fun status(c: Context, id: Int, idx: Int): String? = try {
+        val o = JSONObject(prefs(c).getString("log", "{}"))
+        val k = "${today()}:$id:$idx"
+        if (o.has(k)) o.getString(k) else null
+    } catch (_: Exception) {
+        null
+    }
+
     // breakfast, lunch, dinner (minutes since midnight)
     fun meals(c: Context): IntArray {
         val p = prefs(c)
@@ -133,7 +158,8 @@ object Scheduler {
     const val FIRE = "com.faiz.medicinereminder.FIRE"
     const val TAKEN = "com.faiz.medicinereminder.TAKEN"
     const val SNOOZE = "com.faiz.medicinereminder.SNOOZE"
-    const val CHANNEL = "medicine_due_v1"
+    const val SKIP = "com.faiz.medicinereminder.SKIP"
+    const val CHANNEL = "medicine_due_v2"
 
     fun code(id: Int, idx: Int) = id * 10 + idx
 
@@ -189,11 +215,38 @@ object Scheduler {
     }
 
     fun ensureChannel(c: Context) {
+        val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.deleteNotificationChannel("medicine_due_v1")
         val ch = NotificationChannel(CHANNEL, "Medicine reminders", NotificationManager.IMPORTANCE_HIGH)
         ch.description = "Time to take your medicine"
         ch.enableVibration(true)
         ch.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-        (c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+        val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ALARM)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        ch.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM), attrs)
+        nm.createNotificationChannel(ch)
+    }
+
+    // Taken / Skip / Snooze - used by the notification buttons and the pop-up screen.
+    fun handle(c: Context, act: String, id: Int, idx: Int) {
+        val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.cancel(code(id, idx))
+        when (act) {
+            TAKEN -> {
+                cancelSnooze(c, id, idx)
+                Store.setStatus(c, id, idx, "T")
+            }
+            SKIP -> {
+                cancelSnooze(c, id, idx)
+                Store.setStatus(c, id, idx, "S")
+            }
+            SNOOZE -> {
+                setAlarm(c, id, idx, System.currentTimeMillis() + 10 * 60 * 1000L, true)
+                Toast.makeText(c, "Snoozed for 10 minutes", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 }
 
@@ -204,15 +257,7 @@ class ReminderReceiver : BroadcastReceiver() {
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val code = Scheduler.code(id, idx)
         when (intent.action) {
-            Scheduler.TAKEN -> {
-                nm.cancel(code)
-                Scheduler.cancelSnooze(context, id, idx)
-            }
-            Scheduler.SNOOZE -> {
-                nm.cancel(code)
-                Scheduler.setAlarm(context, id, idx, System.currentTimeMillis() + 10 * 60 * 1000L, true)
-                Toast.makeText(context, "Snoozed for 10 minutes", Toast.LENGTH_SHORT).show()
-            }
+            Scheduler.TAKEN, Scheduler.SKIP, Scheduler.SNOOZE -> Scheduler.handle(context, intent.action!!, id, idx)
             else -> {
                 val m = Store.load(context).firstOrNull { it.id == id } ?: return
                 if (idx >= m.times.size) return
@@ -221,11 +266,19 @@ class ReminderReceiver : BroadcastReceiver() {
                 Scheduler.ensureChannel(context)
                 val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 val open = PendingIntent.getActivity(context, 0, Intent(context, MainActivity::class.java), flags)
+                val popup = PendingIntent.getActivity(
+                    context, code + 40_000_000,
+                    Intent(context, AlarmActivity::class.java).putExtra("id", id).putExtra("idx", idx)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                    flags
+                )
                 fun action(act: String, rc: Int) = PendingIntent.getBroadcast(
                     context, code + rc,
                     Intent(context, ReminderReceiver::class.java).setAction(act).putExtra("id", id).putExtra("idx", idx),
                     flags
                 )
+                fun act(label: String, icon: Int, a: String, rc: Int) =
+                    Notification.Action.Builder(Icon.createWithResource(context, icon), label, action(a, rc)).build()
                 val how = when (m.meal) { 0 -> "Empty stomach"; 1 -> "After meal"; else -> "Anytime" }
                 val text = listOf(m.dose, how).filter { it.isNotBlank() }.joinToString(" • ")
                 val n = Notification.Builder(context, Scheduler.CHANNEL)
@@ -233,15 +286,98 @@ class ReminderReceiver : BroadcastReceiver() {
                     .setContentTitle("Take: ${m.name}")
                     .setContentText(text)
                     .setStyle(Notification.BigTextStyle().bigText("$text\nScheduled ${fmt12(m.times[idx])}"))
-                    .setCategory(Notification.CATEGORY_REMINDER)
+                    .setCategory(Notification.CATEGORY_ALARM)
                     .setVisibility(Notification.VISIBILITY_PUBLIC)
                     .setContentIntent(open)
-                    .addAction(Notification.Action.Builder(Icon.createWithResource(context, android.R.drawable.ic_menu_save), "Taken", action(Scheduler.TAKEN, 20_000_000)).build())
-                    .addAction(Notification.Action.Builder(Icon.createWithResource(context, android.R.drawable.ic_menu_recent_history), "Snooze 10 min", action(Scheduler.SNOOZE, 30_000_000)).build())
+                    .setFullScreenIntent(popup, true)
+                    .setTimeoutAfter(2 * 60 * 1000L)
+                    .addAction(act("Taken", android.R.drawable.ic_menu_save, Scheduler.TAKEN, 20_000_000))
+                    .addAction(act("Snooze", android.R.drawable.ic_menu_recent_history, Scheduler.SNOOZE, 30_000_000))
+                    .addAction(act("Skip", android.R.drawable.ic_menu_close_clear_cancel, Scheduler.SKIP, 50_000_000))
                     .build()
+                n.flags = n.flags or Notification.FLAG_INSISTENT // keep ringing until you respond
                 nm.notify(code, n)
             }
         }
+    }
+}
+
+// Pop-up that appears over the lock screen with the alarm.
+class AlarmActivity : Activity() {
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= 27) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+        }
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        build(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        build(intent)
+    }
+
+    private fun build(i: Intent) {
+        val id = i.getIntExtra("id", -1)
+        val idx = i.getIntExtra("idx", 0)
+        val m = Store.load(this).firstOrNull { it.id == id }
+        if (m == null || idx >= m.times.size) {
+            finish()
+            return
+        }
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.gravity = Gravity.CENTER
+        root.setBackgroundColor(Color.parseColor("#0B5D4A"))
+        root.setPadding(dp(24), dp(48), dp(24), dp(48))
+
+        fun text(t: String, size: Float, bold: Boolean = false): TextView {
+            val v = TextView(this)
+            v.text = t
+            v.textSize = size
+            v.gravity = Gravity.CENTER
+            v.setTextColor(Color.WHITE)
+            if (bold) v.setTypeface(null, Typeface.BOLD)
+            v.setPadding(0, dp(4), 0, dp(4))
+            root.addView(v)
+            return v
+        }
+        text("Time for your medicine", 16f)
+        text(fmt12(m.times[idx]), 40f, true)
+        text(m.name, 28f, true)
+        val how = when (m.meal) { 0 -> "Empty stomach"; 1 -> "After meal"; else -> "Anytime" }
+        text(listOf(m.dose, how).filter { it.isNotBlank() }.joinToString(" • "), 18f)
+
+        fun btn(label: String, bg: String, act: String) {
+            val b = Button(this)
+            b.text = label
+            b.isAllCaps = false
+            b.textSize = 20f
+            b.setTextColor(Color.WHITE)
+            val d = GradientDrawable()
+            d.setColor(Color.parseColor(bg))
+            d.cornerRadius = dp(14).toFloat()
+            b.background = d
+            b.setOnClickListener {
+                Scheduler.handle(this, act, id, idx)
+                finish()
+            }
+            val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64))
+            lp.topMargin = dp(16)
+            root.addView(b, lp)
+        }
+        btn("Taken", "#1FA67A", Scheduler.TAKEN)
+        btn("Snooze 10 min", "#C98A12", Scheduler.SNOOZE)
+        btn("Not taking (skip)", "#A33A3A", Scheduler.SKIP)
+        setContentView(root)
     }
 }
 
@@ -257,6 +393,7 @@ class MainActivity : Activity() {
     private val green = Color.parseColor("#147D64")
     private var askedNotif = false
     private var askedExact = false
+    private var askedFs = false
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -350,6 +487,18 @@ class MainActivity : Activity() {
                     startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")))
                 } catch (_: Exception) {
                 }
+                return
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 34 && !askedFs) {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (!nm.canUseFullScreenIntent()) {
+                askedFs = true
+                Toast.makeText(this, "Allow 'Full screen notifications' so the pop-up shows on the lock screen", Toast.LENGTH_LONG).show()
+                try {
+                    startActivity(Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
+                } catch (_: Exception) {
+                }
             }
         }
     }
@@ -392,7 +541,9 @@ class MainActivity : Activity() {
             card.addView(info)
 
             val times = TextView(this)
-            times.text = m.times.sorted().joinToString("   ") { fmt12(it) }
+            times.text = m.times.mapIndexed { i, t ->
+                fmt12(t) + when (Store.status(this, m.id, i)) { "T" -> " ✓"; "S" -> " ✗"; else -> "" }
+            }.joinToString("   ")
             times.textSize = 16f
             times.setTextColor(green)
             times.setPadding(0, dp(4), 0, dp(4))
@@ -560,7 +711,7 @@ class MainActivity : Activity() {
     private fun showReliability() {
         AlertDialog.Builder(this)
             .setTitle("Make reminders reliable")
-            .setMessage("To get reminders on a locked phone:\n\n1. Allow notifications.\n2. Allow 'Alarms & reminders'.\n3. Set battery to 'Unrestricted' / 'No restrictions' for this app (some phones: Autostart ON).\n\nYou do not need to keep the app open.")
+            .setMessage("To get reminders on a locked phone:\n\n1. Allow notifications.\n2. Allow 'Alarms & reminders' and 'Full screen notifications' (for the lock-screen pop-up).\n3. Set battery to 'Unrestricted' / 'No restrictions' for this app (some phones: Autostart ON).\n\nYou do not need to keep the app open.")
             .setPositiveButton("Battery settings") { _, _ ->
                 try {
                     startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
