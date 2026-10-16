@@ -10,8 +10,16 @@ android {
         applicationId = "com.faiz.medicinereminder"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.1"
+        versionCode = 5
+        versionName = "1.3"
+    }
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

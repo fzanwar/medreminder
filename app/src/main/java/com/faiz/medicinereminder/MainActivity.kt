@@ -24,6 +24,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowManager
@@ -41,7 +42,32 @@ import java.util.Calendar
 
 // ---------- Data ----------
 // meal: 0 = empty stomach, 1 = after meal, 2 = anytime. times = minutes since midnight.
-class Med(val id: Int, var name: String, var dose: String, var meal: Int, var times: MutableList<Int>)
+class Med(
+    val id: Int,
+    var name: String,
+    var dose: String,
+    var meal: Int,
+    var times: MutableList<Int>,
+    val created: String = todayKey(),
+    val createdMin: Int = 0
+)
+
+class Counts {
+    var t = 0
+    var s = 0
+    var m = 0
+    val total get() = t + s + m
+}
+
+fun dayKey(cal: Calendar): String =
+    String.format("%04d%02d%02d", cal.get(Calendar.YEAR), cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH))
+
+fun todayKey(): String = dayKey(Calendar.getInstance())
+
+fun nowMinutes(): Int {
+    val c = Calendar.getInstance()
+    return c.get(Calendar.HOUR_OF_DAY) * 60 + c.get(Calendar.MINUTE)
+}
 
 fun fmt12(min: Int): String {
     val h = min / 60
@@ -50,11 +76,15 @@ fun fmt12(min: Int): String {
     return String.format("%d:%02d %s", h12, m, if (h >= 12) "PM" else "AM")
 }
 
+// Doses before a medicine was added (on the day it was added) are not counted.
+fun applies(m: Med, key: String, t: Int) = !(key == m.created && t < m.createdMin)
+
 object Store {
     private fun prefs(c: Context) = c.getSharedPreferences("medicines", Context.MODE_PRIVATE)
 
     fun load(c: Context): MutableList<Med> {
         val out = mutableListOf<Med>()
+        var changed = false
         try {
             val arr = JSONArray(prefs(c).getString("meds", "[]"))
             for (i in 0 until arr.length()) {
@@ -62,10 +92,18 @@ object Store {
                 val t = o.getJSONArray("times")
                 val times = mutableListOf<Int>()
                 for (j in 0 until t.length()) times.add(t.getInt(j))
-                out.add(Med(o.getInt("id"), o.getString("name"), o.optString("dose", ""), o.optInt("meal", 1), times))
+                var created = o.optString("created", "")
+                var createdMin = o.optInt("createdMin", 0)
+                if (created.isEmpty()) {
+                    created = todayKey()
+                    createdMin = nowMinutes()
+                    changed = true
+                }
+                out.add(Med(o.getInt("id"), o.getString("name"), o.optString("dose", ""), o.optInt("meal", 1), times, created, createdMin))
             }
         } catch (_: Exception) {
         }
+        if (changed) save(c, out)
         return out
     }
 
@@ -78,32 +116,46 @@ object Store {
             o.put("dose", m.dose)
             o.put("meal", m.meal)
             o.put("times", JSONArray(m.times))
+            o.put("created", m.created)
+            o.put("createdMin", m.createdMin)
             arr.put(o)
         }
         prefs(c).edit().putString("meds", arr.toString()).apply()
     }
 
-    private fun today() = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US).format(java.util.Date())
-
-    // Today's record per dose: "T" = taken, "S" = skipped (not taking).
-    fun setStatus(c: Context, id: Int, idx: Int, st: String) {
-        val p = prefs(c)
-        val o = try { JSONObject(p.getString("log", "{}")) } catch (_: Exception) { JSONObject() }
-        val ks = mutableListOf<String>()
-        val iter = o.keys()
-        while (iter.hasNext()) ks.add(iter.next())
-        ks.filter { !it.startsWith(today()) }.forEach { o.remove(it) }
-        o.put("${today()}:$id:$idx", st)
-        p.edit().putString("log", o.toString()).apply()
+    // ----- history: "yyyyMMdd:id:idx" -> "T" (taken) or "S" (not taken) -----
+    fun log(c: Context): MutableMap<String, String> {
+        val out = mutableMapOf<String, String>()
+        try {
+            val o = JSONObject(prefs(c).getString("log", "{}"))
+            val it = o.keys()
+            while (it.hasNext()) {
+                val k = it.next()
+                out[k] = o.getString(k)
+            }
+        } catch (_: Exception) {
+        }
+        return out
     }
 
-    fun status(c: Context, id: Int, idx: Int): String? = try {
-        val o = JSONObject(prefs(c).getString("log", "{}"))
-        val k = "${today()}:$id:$idx"
-        if (o.has(k)) o.getString(k) else null
-    } catch (_: Exception) {
-        null
+    fun setStatus(c: Context, date: String, id: Int, idx: Int, st: String?) {
+        val l = log(c)
+        val k = "$date:$id:$idx"
+        if (st == null) l.remove(k) else l[k] = st
+        val cutoff = Calendar.getInstance()
+        cutoff.add(Calendar.DAY_OF_YEAR, -400)
+        val cut = dayKey(cutoff)
+        val o = JSONObject()
+        for ((key, v) in l) if (key.substringBefore(":") >= cut) o.put(key, v)
+        prefs(c).edit().putString("log", o.toString()).apply()
     }
+
+    fun statusToday(c: Context, id: Int, idx: Int): String? = log(c)["${todayKey()}:$id:$idx"]
+
+    // ----- settings -----
+    fun name(c: Context): String = prefs(c).getString("name", "") ?: ""
+    fun setName(c: Context, n: String) { prefs(c).edit().putString("name", n.trim()).putBoolean("nameAsked", true).apply() }
+    fun nameAsked(c: Context): Boolean = prefs(c).getBoolean("nameAsked", false)
 
     // breakfast, lunch, dinner (minutes since midnight)
     fun meals(c: Context): IntArray {
@@ -154,19 +206,21 @@ object Suggest {
 }
 
 // ---------- Alarms ----------
+// kind: 0 = regular alarm, 1 = snooze, 2 = follow-up ("did you take it?")
 object Scheduler {
     const val FIRE = "com.faiz.medicinereminder.FIRE"
     const val TAKEN = "com.faiz.medicinereminder.TAKEN"
     const val SNOOZE = "com.faiz.medicinereminder.SNOOZE"
     const val SKIP = "com.faiz.medicinereminder.SKIP"
     const val CHANNEL = "medicine_due_v2"
+    const val CHANNEL_FOLLOW = "medicine_followup_v1"
 
     fun code(id: Int, idx: Int) = id * 10 + idx
 
-    private fun pi(c: Context, id: Int, idx: Int, snooze: Boolean): PendingIntent {
+    private fun pi(c: Context, id: Int, idx: Int, kind: Int): PendingIntent {
         val i = Intent(c, ReminderReceiver::class.java).setAction(FIRE)
-            .putExtra("id", id).putExtra("idx", idx).putExtra("snooze", snooze)
-        val rc = code(id, idx) + if (snooze) 10_000_000 else 0
+            .putExtra("id", id).putExtra("idx", idx).putExtra("kind", kind)
+        val rc = code(id, idx) + when (kind) { 1 -> 10_000_000; 2 -> 60_000_000; else -> 0 }
         return PendingIntent.getBroadcast(c, rc, i, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     }
 
@@ -183,34 +237,39 @@ object Scheduler {
         return cal.timeInMillis
     }
 
-    fun setAlarm(c: Context, id: Int, idx: Int, at: Long, snooze: Boolean) {
+    // Alarm-clock type alarms are exempt from battery saving (Doze), so they fire on time.
+    fun setAlarm(c: Context, id: Int, idx: Int, at: Long, kind: Int) {
         val a = am(c)
-        val p = pi(c, id, idx, snooze)
-        val exact = Build.VERSION.SDK_INT < 31 || a.canScheduleExactAlarms()
+        val p = pi(c, id, idx, kind)
+        val show = PendingIntent.getActivity(
+            c, 1, Intent(c, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         try {
-            if (exact) a.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
-            else a.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
+            a.setAlarmClock(AlarmManager.AlarmClockInfo(at, show), p)
         } catch (_: SecurityException) {
             a.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, p)
         }
     }
 
     fun schedule(c: Context, m: Med) {
-        m.times.forEachIndexed { i, t -> setAlarm(c, m.id, i, nextTrigger(t), false) }
+        m.times.forEachIndexed { i, t -> setAlarm(c, m.id, i, nextTrigger(t), 0) }
     }
 
     fun scheduleAll(c: Context) {
         Store.load(c).forEach { schedule(c, it) }
     }
 
-    fun cancelSnooze(c: Context, id: Int, idx: Int) {
-        am(c).cancel(pi(c, id, idx, true))
+    fun cancelKind(c: Context, id: Int, idx: Int, kind: Int) {
+        am(c).cancel(pi(c, id, idx, kind))
     }
 
     fun cancel(c: Context, id: Int) {
+        val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         for (i in 0..3) {
-            am(c).cancel(pi(c, id, i, false))
-            am(c).cancel(pi(c, id, i, true))
+            for (k in 0..2) am(c).cancel(pi(c, id, i, k))
+            nm.cancel(code(id, i))
+            nm.cancel(code(id, i) + 70_000_000)
         }
     }
 
@@ -227,23 +286,29 @@ object Scheduler {
             .build()
         ch.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM), attrs)
         nm.createNotificationChannel(ch)
+        val f = NotificationChannel(CHANNEL_FOLLOW, "Did you take it?", NotificationManager.IMPORTANCE_DEFAULT)
+        f.description = "Quiet follow-up if you did not respond to a reminder"
+        f.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        nm.createNotificationChannel(f)
     }
 
-    // Taken / Skip / Snooze - used by the notification buttons and the pop-up screen.
+    // Taken / Skip / Snooze - used by notification buttons, the pop-up and the Today screen.
     fun handle(c: Context, act: String, id: Int, idx: Int) {
         val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.cancel(code(id, idx))
+        nm.cancel(code(id, idx) + 70_000_000)
+        cancelKind(c, id, idx, 2)
         when (act) {
             TAKEN -> {
-                cancelSnooze(c, id, idx)
-                Store.setStatus(c, id, idx, "T")
+                cancelKind(c, id, idx, 1)
+                Store.setStatus(c, todayKey(), id, idx, "T")
             }
             SKIP -> {
-                cancelSnooze(c, id, idx)
-                Store.setStatus(c, id, idx, "S")
+                cancelKind(c, id, idx, 1)
+                Store.setStatus(c, todayKey(), id, idx, "S")
             }
             SNOOZE -> {
-                setAlarm(c, id, idx, System.currentTimeMillis() + 10 * 60 * 1000L, true)
+                setAlarm(c, id, idx, System.currentTimeMillis() + 10 * 60 * 1000L, 1)
                 Toast.makeText(c, "Snoozed for 10 minutes", Toast.LENGTH_SHORT).show()
             }
         }
@@ -254,6 +319,7 @@ class ReminderReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val id = intent.getIntExtra("id", -1)
         val idx = intent.getIntExtra("idx", 0)
+        val kind = intent.getIntExtra("kind", 0)
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val code = Scheduler.code(id, idx)
         when (intent.action) {
@@ -262,16 +328,12 @@ class ReminderReceiver : BroadcastReceiver() {
                 val m = Store.load(context).firstOrNull { it.id == id } ?: return
                 if (idx >= m.times.size) return
                 // Set tomorrow's alarm first so it is never lost.
-                if (!intent.getBooleanExtra("snooze", false)) Scheduler.schedule(context, m)
+                if (kind == 0) Scheduler.schedule(context, m)
+                // Already marked today (for example taken early)? Stay quiet.
+                if (Store.statusToday(context, id, idx) != null) return
                 Scheduler.ensureChannel(context)
                 val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 val open = PendingIntent.getActivity(context, 0, Intent(context, MainActivity::class.java), flags)
-                val popup = PendingIntent.getActivity(
-                    context, code + 40_000_000,
-                    Intent(context, AlarmActivity::class.java).putExtra("id", id).putExtra("idx", idx)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
-                    flags
-                )
                 fun action(act: String, rc: Int) = PendingIntent.getBroadcast(
                     context, code + rc,
                     Intent(context, ReminderReceiver::class.java).setAction(act).putExtra("id", id).putExtra("idx", idx),
@@ -281,9 +343,36 @@ class ReminderReceiver : BroadcastReceiver() {
                     Notification.Action.Builder(Icon.createWithResource(context, icon), label, action(a, rc)).build()
                 val how = when (m.meal) { 0 -> "Empty stomach"; 1 -> "After meal"; else -> "Anytime" }
                 val text = listOf(m.dose, how).filter { it.isNotBlank() }.joinToString(" • ")
+                val who = Store.name(context)
+
+                if (kind == 2) {
+                    // Quiet follow-up that stays until answered.
+                    val n = Notification.Builder(context, Scheduler.CHANNEL_FOLLOW)
+                        .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                        .setContentTitle("Did you take ${m.name}?")
+                        .setContentText("Scheduled ${fmt12(m.times[idx])} - tap Taken or Not taken")
+                        .setCategory(Notification.CATEGORY_REMINDER)
+                        .setVisibility(Notification.VISIBILITY_PUBLIC)
+                        .setContentIntent(open)
+                        .addAction(act("Taken", android.R.drawable.ic_menu_save, Scheduler.TAKEN, 20_000_000))
+                        .addAction(act("Not taken", android.R.drawable.ic_menu_close_clear_cancel, Scheduler.SKIP, 50_000_000))
+                        .build()
+                    nm.notify(code + 70_000_000, n)
+                    return
+                }
+
+                // Check again 10 minutes later if there is still no answer.
+                Scheduler.setAlarm(context, id, idx, System.currentTimeMillis() + 10 * 60 * 1000L, 2)
+                val popup = PendingIntent.getActivity(
+                    context, code + 40_000_000,
+                    Intent(context, AlarmActivity::class.java).putExtra("id", id).putExtra("idx", idx)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                    flags
+                )
+                val title = if (who.isBlank()) "Take: ${m.name}" else "$who, take: ${m.name}"
                 val n = Notification.Builder(context, Scheduler.CHANNEL)
                     .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-                    .setContentTitle("Take: ${m.name}")
+                    .setContentTitle(title)
                     .setContentText(text)
                     .setStyle(Notification.BigTextStyle().bigText("$text\nScheduled ${fmt12(m.times[idx])}"))
                     .setCategory(Notification.CATEGORY_ALARM)
@@ -329,7 +418,7 @@ class AlarmActivity : Activity() {
         val id = i.getIntExtra("id", -1)
         val idx = i.getIntExtra("idx", 0)
         val m = Store.load(this).firstOrNull { it.id == id }
-        if (m == null || idx >= m.times.size) {
+        if (m == null || idx >= m.times.size || Store.statusToday(this, id, idx) != null) {
             finish()
             return
         }
@@ -339,7 +428,7 @@ class AlarmActivity : Activity() {
         root.setBackgroundColor(Color.parseColor("#0B5D4A"))
         root.setPadding(dp(24), dp(48), dp(24), dp(48))
 
-        fun text(t: String, size: Float, bold: Boolean = false): TextView {
+        fun text(t: String, size: Float, bold: Boolean = false) {
             val v = TextView(this)
             v.text = t
             v.textSize = size
@@ -348,9 +437,9 @@ class AlarmActivity : Activity() {
             if (bold) v.setTypeface(null, Typeface.BOLD)
             v.setPadding(0, dp(4), 0, dp(4))
             root.addView(v)
-            return v
         }
-        text("Time for your medicine", 16f)
+        val who = Store.name(this)
+        text(if (who.isBlank()) "Time for your medicine" else "$who, time for your medicine", 16f)
         text(fmt12(m.times[idx]), 40f, true)
         text(m.name, 28f, true)
         val how = when (m.meal) { 0 -> "Empty stomach"; 1 -> "After meal"; else -> "Anytime" }
@@ -387,13 +476,19 @@ class BootReceiver : BroadcastReceiver() {
     }
 }
 
-// ---------- Screen ----------
+// ---------- Screens ----------
 class MainActivity : Activity() {
-    private lateinit var list: LinearLayout
-    private val green = Color.parseColor("#147D64")
+    private lateinit var content: LinearLayout
+    private lateinit var tabBar: LinearLayout
+    private lateinit var subtitle: TextView
+    private var tab = 0
+    private var reportDays = 7
     private var askedNotif = false
     private var askedExact = false
     private var askedFs = false
+    private val green = Color.parseColor("#147D64")
+    private val ink = Color.parseColor("#12332B")
+    private val tabNames = arrayOf("Today", "Medicines", "Report", "Settings")
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -401,6 +496,32 @@ class MainActivity : Activity() {
         setColor(color)
         cornerRadius = dp(r).toFloat()
     }
+
+    private fun tv(t: String, size: Float = 14f, bold: Boolean = false, color: Int = ink): TextView {
+        val v = TextView(this)
+        v.text = t
+        v.textSize = size
+        v.setTextColor(color)
+        if (bold) v.setTypeface(null, Typeface.BOLD)
+        return v
+    }
+
+    private fun card(): LinearLayout {
+        val c = LinearLayout(this)
+        c.orientation = LinearLayout.VERTICAL
+        c.background = roundBg(Color.WHITE)
+        c.setPadding(dp(16), dp(12), dp(16), dp(12))
+        return c
+    }
+
+    private fun add(v: View, top: Int = 10) {
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        lp.topMargin = dp(top)
+        content.addView(v, lp)
+    }
+
+    private fun mealLabel(i: Int) = when (i) { 0 -> "Empty stomach"; 1 -> "After meal"; else -> "Anytime" }
+    private fun freqLabel(n: Int) = when (n) { 1 -> "Once a day"; 2 -> "Twice a day"; 3 -> "3 times a day"; else -> "4 times a day" }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -424,43 +545,46 @@ class MainActivity : Activity() {
             ins
         }
 
-        val title = TextView(this)
-        title.text = "Medicine Reminder"
-        title.textSize = 22f
-        title.setTextColor(Color.WHITE)
-        title.setTypeface(null, Typeface.BOLD)
-        title.setPadding(dp(18), dp(14), dp(18), dp(14))
-        root.addView(title)
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.VERTICAL
+        head.setPadding(dp(18), dp(12), dp(18), dp(12))
+        head.addView(tv("Medicine Reminder", 22f, true, Color.WHITE))
+        subtitle = tv("", 14f, false, Color.parseColor("#CFEDE3"))
+        head.addView(subtitle)
+        root.addView(head)
 
         val body = LinearLayout(this)
         body.orientation = LinearLayout.VERTICAL
         body.setBackgroundColor(Color.parseColor("#F3F7F5"))
 
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.setPadding(dp(8), dp(8), dp(8), 0)
-        fun btn(label: String, onClick: () -> Unit): Button {
-            val b = Button(this)
-            b.text = label
-            b.isAllCaps = false
-            b.setOnClickListener { onClick() }
-            row.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            return b
-        }
-        btn("+ Add") { showForm(null) }
-        btn("Meal times") { showMealTimes() }
-        btn("Reliability") { showReliability() }
-        body.addView(row)
-
         val scroll = ScrollView(this)
-        list = LinearLayout(this)
-        list.orientation = LinearLayout.VERTICAL
-        list.setPadding(dp(12), dp(8), dp(12), dp(24))
-        scroll.addView(list)
+        content = LinearLayout(this)
+        content.orientation = LinearLayout.VERTICAL
+        content.setPadding(dp(12), dp(4), dp(12), dp(24))
+        scroll.addView(content)
         body.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        tabBar = LinearLayout(this)
+        tabBar.orientation = LinearLayout.HORIZONTAL
+        tabBar.setBackgroundColor(Color.WHITE)
+        for (i in tabNames.indices) {
+            val t = TextView(this)
+            t.text = tabNames[i]
+            t.textSize = 14f
+            t.gravity = Gravity.CENTER
+            t.setPadding(0, dp(14), 0, dp(14))
+            t.setOnClickListener {
+                tab = i
+                render()
+            }
+            tabBar.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        body.addView(tabBar)
 
         root.addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
+
+        if (Store.name(this).isBlank() && !Store.nameAsked(this)) askName()
     }
 
     override fun onResume() {
@@ -470,6 +594,271 @@ class MainActivity : Activity() {
         checkSetup()
     }
 
+    private fun render() {
+        val who = Store.name(this)
+        subtitle.text = if (who.isBlank()) "Take care of your health" else "Hello, $who"
+        for (i in 0 until tabBar.childCount) {
+            val t = tabBar.getChildAt(i) as TextView
+            t.setTextColor(if (i == tab) green else Color.GRAY)
+            t.setTypeface(null, if (i == tab) Typeface.BOLD else Typeface.NORMAL)
+        }
+        content.removeAllViews()
+        when (tab) {
+            0 -> renderToday()
+            1 -> renderMeds()
+            2 -> renderReport()
+            else -> renderSettings()
+        }
+    }
+
+    // ----- Name -----
+    private fun askName() {
+        val e = EditText(this)
+        e.hint = "Your name"
+        e.setSingleLine()
+        val p = LinearLayout(this)
+        p.setPadding(dp(20), dp(8), dp(20), 0)
+        p.addView(e, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        AlertDialog.Builder(this)
+            .setTitle("What should I call you?")
+            .setView(p)
+            .setPositiveButton("Save") { _, _ ->
+                Store.setName(this, e.text.toString())
+                render()
+            }
+            .setNegativeButton("Skip") { _, _ -> Store.setName(this, "") }
+            .show()
+    }
+
+    // ----- Today -----
+    private fun renderToday() {
+        val meds = Store.load(this)
+        val key = todayKey()
+        val log = Store.log(this)
+        val now = nowMinutes()
+        val doses = mutableListOf<Triple<Int, Med, Int>>()
+        for (m in meds) m.times.forEachIndexed { i, t -> if (applies(m, key, t)) doses.add(Triple(t, m, i)) }
+        doses.sortBy { it.first }
+        if (doses.isEmpty()) {
+            val t = tv("No doses today.\nAdd a medicine in the Medicines tab.", 16f)
+            t.gravity = Gravity.CENTER
+            t.setPadding(dp(16), dp(48), dp(16), dp(16))
+            add(t)
+            return
+        }
+        val done = doses.count { log["$key:${it.second.id}:${it.third}"] == "T" }
+        add(tv("Today: $done of ${doses.size} taken", 16f, true, green), 12)
+        add(tv("Tap a dose to mark it taken or not taken.", 13f, false, Color.GRAY), 2)
+        for ((t, m, i) in doses) {
+            val st = log["$key:${m.id}:$i"]
+            val c = card()
+            c.addView(tv("${fmt12(t)}   ${m.name}" + if (m.dose.isNotBlank()) "  (${m.dose})" else "", 17f, true))
+            c.addView(tv(mealLabel(m.meal), 13f, false, Color.GRAY))
+            val (label, col) = when {
+                st == "T" -> Pair("✓ Taken", "#1B8A5A")
+                st == "S" -> Pair("✗ Not taken", "#B23B3B")
+                t > now -> Pair("Upcoming", "#666666")
+                else -> Pair("! Not marked - tap to update", "#C98A12")
+            }
+            c.addView(tv(label, 15f, true, Color.parseColor(col)))
+            c.setOnClickListener {
+                AlertDialog.Builder(this)
+                    .setTitle("${m.name} - ${fmt12(t)}")
+                    .setItems(arrayOf("Mark as taken", "Mark as not taken", "Clear mark")) { _, w ->
+                        when (w) {
+                            0 -> Scheduler.handle(this, Scheduler.TAKEN, m.id, i)
+                            1 -> Scheduler.handle(this, Scheduler.SKIP, m.id, i)
+                            else -> Store.setStatus(this, key, m.id, i, null)
+                        }
+                        render()
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+            add(c)
+        }
+    }
+
+    // ----- Medicines -----
+    private fun renderMeds() {
+        val b = Button(this)
+        b.text = "+ Add medicine"
+        b.isAllCaps = false
+        b.setOnClickListener { showForm(null) }
+        add(b, 8)
+        val meds = Store.load(this).sortedBy { it.times.minOrNull() ?: 0 }
+        if (meds.isEmpty()) {
+            val t = tv("No medicines yet.", 16f)
+            t.gravity = Gravity.CENTER
+            t.setPadding(dp(16), dp(32), dp(16), dp(16))
+            add(t)
+            return
+        }
+        add(tv("Tap a medicine to edit or delete it.", 13f, false, Color.GRAY), 2)
+        for (m in meds) {
+            val c = card()
+            c.addView(tv(m.name + if (m.dose.isNotBlank()) "  (${m.dose})" else "", 18f, true))
+            c.addView(tv(mealLabel(m.meal) + " • " + freqLabel(m.times.size), 14f))
+            c.addView(tv(m.times.sorted().joinToString("   ") { fmt12(it) }, 16f, false, green))
+            c.setOnClickListener { showManage(m) }
+            add(c)
+        }
+    }
+
+    // Edit / Delete live here, not on the list, so they cannot be hit by accident.
+    private fun showManage(m: Med) {
+        AlertDialog.Builder(this)
+            .setTitle(m.name)
+            .setMessage(
+                (if (m.dose.isNotBlank()) "Dose: ${m.dose}\n" else "") +
+                    mealLabel(m.meal) + " • " + freqLabel(m.times.size) + "\n" +
+                    m.times.sorted().joinToString(", ") { fmt12(it) }
+            )
+            .setPositiveButton("Edit") { _, _ -> showForm(m) }
+            .setNegativeButton("Delete") { _, _ ->
+                AlertDialog.Builder(this)
+                    .setTitle("Delete ${m.name}?")
+                    .setMessage("Its reminders will stop. Past records stay in the report.")
+                    .setPositiveButton("Yes, delete") { _, _ ->
+                        Scheduler.cancel(this, m.id)
+                        val all = Store.load(this)
+                        all.removeAll { it.id == m.id }
+                        Store.save(this, all)
+                        render()
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+            .setNeutralButton("Close", null)
+            .show()
+    }
+
+    // ----- Report -----
+    private fun renderReport() {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        for ((label, days) in listOf(Pair("Last 7 days", 7), Pair("Last 30 days", 30))) {
+            val b = Button(this)
+            b.text = label
+            b.isAllCaps = false
+            b.alpha = if (reportDays == days) 1f else 0.5f
+            b.setOnClickListener {
+                reportDays = days
+                render()
+            }
+            row.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        add(row, 8)
+
+        val meds = Store.load(this)
+        val log = Store.log(this)
+        val now = nowMinutes()
+        val total = Counts()
+        val perMed = LinkedHashMap<Int, Counts>()
+        val perDay = mutableListOf<Pair<String, Counts>>()
+        val fmt = java.text.SimpleDateFormat("EEE, d MMM", java.util.Locale.getDefault())
+        for (d in 0 until reportDays) {
+            val cal = Calendar.getInstance()
+            cal.add(Calendar.DAY_OF_YEAR, -d)
+            val key = dayKey(cal)
+            val dc = Counts()
+            for (m in meds) {
+                m.times.forEachIndexed { i, t ->
+                    if (key < m.created || !applies(m, key, t)) return@forEachIndexed
+                    val st = log["$key:${m.id}:$i"]
+                    val pm = perMed.getOrPut(m.id) { Counts() }
+                    when {
+                        st == "T" -> { total.t++; dc.t++; pm.t++ }
+                        st == "S" -> { total.s++; dc.s++; pm.s++ }
+                        d == 0 && t > now -> { }
+                        else -> { total.m++; dc.m++; pm.m++ }
+                    }
+                }
+            }
+            perDay.add(Pair(fmt.format(cal.time), dc))
+        }
+
+        val sum = card()
+        val pct = if (total.total == 0) "-" else "${total.t * 100 / total.total}%"
+        sum.addView(tv("Taken on time: $pct", 20f, true, green))
+        sum.addView(tv("✓ Taken: ${total.t}", 16f, false, Color.parseColor("#1B8A5A")))
+        sum.addView(tv("✗ Not taken (skipped): ${total.s}", 16f, false, Color.parseColor("#B23B3B")))
+        sum.addView(tv("! Missed (no answer): ${total.m}", 16f, false, Color.parseColor("#C98A12")))
+        add(sum)
+
+        if (total.total == 0) {
+            add(tv("No records yet. The report fills up as you mark your doses.", 14f, false, Color.GRAY))
+            return
+        }
+
+        add(tv("By medicine", 16f, true), 16)
+        for (m in meds) {
+            val c = perMed[m.id] ?: continue
+            val card = card()
+            card.addView(tv(m.name, 16f, true))
+            card.addView(tv("✓ ${c.t}    ✗ ${c.s}    ! ${c.m}", 15f))
+            add(card, 6)
+        }
+
+        add(tv("By day", 16f, true), 16)
+        val days = card()
+        for ((label, c) in perDay) {
+            if (c.total == 0) continue
+            val r = LinearLayout(this)
+            r.orientation = LinearLayout.HORIZONTAL
+            r.addView(tv(label, 15f), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            r.addView(tv("✓ ${c.t}   ✗ ${c.s}   ! ${c.m}", 15f))
+            r.setPadding(0, dp(4), 0, dp(4))
+            days.addView(r)
+        }
+        add(days, 6)
+    }
+
+    // ----- Settings -----
+    private fun renderSettings() {
+        val nameCard = card()
+        nameCard.addView(tv("Your name", 16f, true))
+        val e = EditText(this)
+        e.hint = "Your name"
+        e.setSingleLine()
+        e.setText(Store.name(this))
+        nameCard.addView(e)
+        val save = Button(this)
+        save.text = "Save name"
+        save.isAllCaps = false
+        save.setOnClickListener {
+            Store.setName(this, e.text.toString())
+            Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()
+            render()
+        }
+        nameCard.addView(save)
+        add(nameCard, 8)
+
+        val meals = Store.meals(this)
+        val mc = card()
+        mc.addView(tv("Meal times", 16f, true))
+        mc.addView(tv("Breakfast ${fmt12(meals[0])}  •  Lunch ${fmt12(meals[1])}  •  Dinner ${fmt12(meals[2])}", 14f))
+        val mb = Button(this)
+        mb.text = "Change meal times"
+        mb.isAllCaps = false
+        mb.setOnClickListener { showMealTimes() }
+        mc.addView(mb)
+        add(mc)
+
+        val rc = card()
+        rc.addView(tv("Reliability", 16f, true))
+        rc.addView(tv("Make sure reminders ring on a locked phone.", 14f))
+        val rb = Button(this)
+        rb.text = "Check settings"
+        rb.isAllCaps = false
+        rb.setOnClickListener { showReliability() }
+        rc.addView(rb)
+        add(rc)
+
+        add(tv("Medicine Reminder v1.3", 12f, false, Color.GRAY), 16)
+    }
+
+    // ----- Permissions -----
     private fun checkSetup() {
         if (Build.VERSION.SDK_INT >= 33 && !askedNotif &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -477,18 +866,6 @@ class MainActivity : Activity() {
             askedNotif = true
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
             return
-        }
-        if (Build.VERSION.SDK_INT >= 31 && !askedExact) {
-            val a = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            if (!a.canScheduleExactAlarms()) {
-                askedExact = true
-                Toast.makeText(this, "Please allow 'Alarms & reminders' for this app", Toast.LENGTH_LONG).show()
-                try {
-                    startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:$packageName")))
-                } catch (_: Exception) {
-                }
-                return
-            }
         }
         if (Build.VERSION.SDK_INT >= 34 && !askedFs) {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -508,75 +885,7 @@ class MainActivity : Activity() {
         checkSetup()
     }
 
-    private fun render() {
-        list.removeAllViews()
-        val meds = Store.load(this).sortedBy { it.times.minOrNull() ?: 0 }
-        if (meds.isEmpty()) {
-            val t = TextView(this)
-            t.text = "No medicines yet.\nTap \"+ Add\" to add one."
-            t.textSize = 16f
-            t.gravity = Gravity.CENTER
-            t.setPadding(dp(16), dp(48), dp(16), dp(16))
-            list.addView(t)
-            return
-        }
-        for (m in meds) {
-            val card = LinearLayout(this)
-            card.orientation = LinearLayout.VERTICAL
-            card.background = roundBg(Color.WHITE)
-            card.setPadding(dp(16), dp(12), dp(16), dp(8))
-            val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            lp.topMargin = dp(10)
-
-            val name = TextView(this)
-            name.text = m.name + if (m.dose.isNotBlank()) "  (${m.dose})" else ""
-            name.textSize = 18f
-            name.setTypeface(null, Typeface.BOLD)
-            name.setTextColor(Color.parseColor("#12332B"))
-            card.addView(name)
-
-            val info = TextView(this)
-            info.text = mealLabel(m.meal) + " • " + freqLabel(m.times.size)
-            info.textSize = 14f
-            card.addView(info)
-
-            val times = TextView(this)
-            times.text = m.times.mapIndexed { i, t ->
-                fmt12(t) + when (Store.status(this, m.id, i)) { "T" -> " ✓"; "S" -> " ✗"; else -> "" }
-            }.joinToString("   ")
-            times.textSize = 16f
-            times.setTextColor(green)
-            times.setPadding(0, dp(4), 0, dp(4))
-            card.addView(times)
-
-            val br = LinearLayout(this)
-            br.orientation = LinearLayout.HORIZONTAL
-            br.gravity = Gravity.END
-            val edit = Button(this)
-            edit.text = "Edit"
-            edit.setOnClickListener { showForm(m) }
-            val del = Button(this)
-            del.text = "Delete"
-            del.setOnClickListener {
-                AlertDialog.Builder(this).setTitle("Delete ${m.name}?")
-                    .setPositiveButton("Delete") { _, _ ->
-                        Scheduler.cancel(this, m.id)
-                        val all = Store.load(this)
-                        all.removeAll { it.id == m.id }
-                        Store.save(this, all)
-                        render()
-                    }.setNegativeButton("Cancel", null).show()
-            }
-            br.addView(edit)
-            br.addView(del)
-            card.addView(br)
-            list.addView(card, lp)
-        }
-    }
-
-    private fun mealLabel(i: Int) = when (i) { 0 -> "Empty stomach"; 1 -> "After meal"; else -> "Anytime" }
-    private fun freqLabel(n: Int) = when (n) { 1 -> "Once a day"; 2 -> "Twice a day"; 3 -> "3 times a day"; else -> "4 times a day" }
-
+    // ----- Add / edit -----
     // Step 1: name, dose, meal rule, how many times a day.
     private fun showForm(existing: Med?) {
         val p = LinearLayout(this)
@@ -656,12 +965,17 @@ class MainActivity : Activity() {
             .setView(p)
             .setPositiveButton("Save") { _, _ ->
                 val all = Store.load(this)
-                val med = existing ?: Med(newId(all), name, dose, meal, times)
-                if (existing != null) Scheduler.cancel(this, existing.id)
-                med.name = name
-                med.dose = dose
-                med.meal = meal
-                med.times = times.sorted().toMutableList()
+                val sorted = times.sorted().toMutableList()
+                val med = if (existing != null) {
+                    Scheduler.cancel(this, existing.id)
+                    existing.name = name
+                    existing.dose = dose
+                    existing.meal = meal
+                    existing.times = sorted
+                    existing
+                } else {
+                    Med(newId(all), name, dose, meal, sorted, todayKey(), nowMinutes())
+                }
                 all.removeAll { it.id == med.id }
                 all.add(med)
                 Store.save(this, all)
@@ -705,13 +1019,14 @@ class MainActivity : Activity() {
             }
             p.addView(b)
         }
-        AlertDialog.Builder(this).setTitle("Your meal times").setView(p).setPositiveButton("Done", null).show()
+        AlertDialog.Builder(this).setTitle("Your meal times").setView(p)
+            .setPositiveButton("Done") { _, _ -> render() }.show()
     }
 
     private fun showReliability() {
         AlertDialog.Builder(this)
             .setTitle("Make reminders reliable")
-            .setMessage("To get reminders on a locked phone:\n\n1. Allow notifications.\n2. Allow 'Alarms & reminders' and 'Full screen notifications' (for the lock-screen pop-up).\n3. Set battery to 'Unrestricted' / 'No restrictions' for this app (some phones: Autostart ON).\n\nYou do not need to keep the app open.")
+            .setMessage("To get reminders on a locked phone:\n\n1. Allow notifications.\n2. Allow 'Full screen notifications' (for the lock-screen pop-up).\n3. Set battery to 'Unrestricted' / 'No restrictions' for this app (some phones: Autostart ON).\n\nYou do not need to keep the app open.")
             .setPositiveButton("Battery settings") { _, _ ->
                 try {
                     startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
