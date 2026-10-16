@@ -10,12 +10,15 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.TimePickerDialog
 import android.content.BroadcastReceiver
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.pdf.PdfDocument
 import android.graphics.drawable.Icon
 import android.media.AudioAttributes
 import android.media.RingtoneManager
@@ -34,8 +37,10 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.FileProvider
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
@@ -157,6 +162,11 @@ object Store {
     fun setName(c: Context, n: String) { prefs(c).edit().putString("name", n.trim()).putBoolean("nameAsked", true).apply() }
     fun nameAsked(c: Context): Boolean = prefs(c).getBoolean("nameAsked", false)
 
+    fun feature(c: Context, name: String, default: Boolean): Boolean = prefs(c).getBoolean("feat_$name", default)
+    fun setFeature(c: Context, name: String, on: Boolean) { prefs(c).edit().putBoolean("feat_$name", on).apply() }
+    fun noticeSeen(c: Context): Boolean = prefs(c).getBoolean("noticeSeen", false)
+    fun setNoticeSeen(c: Context) { prefs(c).edit().putBoolean("noticeSeen", true).apply() }
+
     // breakfast, lunch, dinner (minutes since midnight)
     fun meals(c: Context): IntArray {
         val p = prefs(c)
@@ -165,6 +175,255 @@ object Store {
 
     fun saveMeals(c: Context, m: IntArray) {
         prefs(c).edit().putInt("b", m[0]).putInt("l", m[1]).putInt("d", m[2]).apply()
+    }
+}
+
+// ---------- Daily health quotes (original lines, work offline) ----------
+object Quotes {
+    private val list = listOf(
+        "Small steps every day add up to big changes in health.",
+        "Medicine taken on time works best.",
+        "A glass of water is a small act of self-care.",
+        "Rest is part of recovery, not a delay in it.",
+        "Consistency beats intensity, every single day.",
+        "Your future self will thank you for today's good habits.",
+        "Listen to your body; it speaks quietly before it shouts.",
+        "A ten-minute walk is better than no walk.",
+        "Healthy habits are built one ordinary day at a time.",
+        "Sleep is not a luxury; it is how the body repairs itself.",
+        "Eat slowly. Your body notices when you pay attention.",
+        "Progress, not perfection, is the goal.",
+        "Missing a dose is not a failure; getting back on track is a win.",
+        "Good health is a daily routine, not a one-time effort.",
+        "Breathe in calm, breathe out tension.",
+        "A colourful plate is a healthy plate.",
+        "Move a little more than yesterday.",
+        "Kind words to yourself are good for your health too.",
+        "Your health is worth a few minutes every day.",
+        "Stay curious about how your body feels.",
+        "Fresh air and sunlight are free medicine for the mood.",
+        "Take the stairs when you can.",
+        "Prevention is easier than cure.",
+        "A calm mind helps a healthy body.",
+        "Today is a good day to start.",
+        "Drink water, stretch, smile: repeat.",
+        "Ask your doctor when in doubt; questions are part of good care.",
+        "Little habits, repeated, become big strengths.",
+        "Healing takes time; be patient with yourself.",
+        "Fuel your body like you care about it.",
+        "A short pause to breathe can reset a hard day.",
+        "Wash your hands, protect your health.",
+        "Sit less, move more.",
+        "Gratitude is good for the heart.",
+        "Keep your routine simple and your reminders on.",
+        "Every healthy choice counts, however small.",
+        "Good sleep, good food, good company: a simple recipe.",
+        "Be as patient with your body as you are with others.",
+        "Energy follows care.",
+        "Stretch in the morning; thank your body for another day.",
+        "Health is the quiet foundation of every other goal.",
+        "Do not wait for symptoms to take care of yourself.",
+        "One healthy meal at a time.",
+        "A regular routine is a gift to your body.",
+        "Laughter is light exercise for the soul.",
+        "Switch off screens early; sleep will thank you.",
+        "Plan your day around your health, not the other way around.",
+        "You do not have to be perfect, just persistent.",
+        "Check in with how you feel, not only with how you look.",
+        "Take your time; healthy things grow slowly.",
+        "A good habit started today is a gift for years.",
+        "Stay hydrated, stay kind, stay moving.",
+        "Rest well; tomorrow needs you.",
+        "Strong body, calm mind, steady routine.",
+        "Choose the habit you will keep, not the one that sounds impressive.",
+        "Your body does a lot for you every second; return the favour.",
+        "Celebrate small wins, like a dose taken on time.",
+        "Fruits and vegetables: the easiest upgrade.",
+        "Slow down; health is not a race.",
+        "Care for yourself the way you care for the people you love.",
+        "Morning light helps the body wake up well.",
+        "Regular meals help steady your energy.",
+        "Quiet moments are good medicine for stress.",
+        "Walk after a meal; digestion likes it.",
+        "Be gentle on days when energy is low.",
+        "Good health begins with small decisions.",
+        "Set a reminder, build a routine, protect your health.",
+        "What you do daily matters more than what you do occasionally.",
+        "Look after your health today so tomorrow is easier.",
+        "Be proud of showing up for your health.",
+        "A balanced day: some work, some rest, some play.",
+        "Keep moving, even if it is slow.",
+        "Health is wealth you carry with you.",
+        "Notice what makes you feel well, and do more of it.",
+        "Healthy ageing is built in everyday moments.",
+        "Keep a regular sleep time, even on holidays.",
+        "Choose water over a sugary drink when you can.",
+        "You are doing better than you think.",
+        "Take a deep breath. You have got this.",
+        "Health is a journey, and every day is a step."
+    )
+
+    fun today(): String {
+        val c = Calendar.getInstance()
+        val n = c.get(Calendar.DAY_OF_YEAR) + 366 * (c.get(Calendar.YEAR) - 2026)
+        return list[((n % list.size) + list.size) % list.size]
+    }
+}
+
+// ---------- Report data (used by the Report tab and by Export) ----------
+fun mealText(i: Int) = when (i) { 0 -> "Empty stomach"; 1 -> "After meal"; else -> "Anytime" }
+
+class DoseRow(val dateFull: String, val dateLabel: String, val time: Int, val med: String, val dose: String, val meal: Int, val status: String)
+
+class ReportData(
+    val days: Int,
+    val from: String,
+    val to: String,
+    val total: Counts,
+    val perMed: List<Pair<String, Counts>>,
+    val perDay: List<Pair<String, Counts>>,
+    val rows: List<DoseRow>
+)
+
+fun buildReport(c: Context, days: Int): ReportData {
+    val meds = Store.load(c)
+    val log = Store.log(c)
+    val now = nowMinutes()
+    val total = Counts()
+    val perMed = LinkedHashMap<Int, Counts>()
+    val perDay = mutableListOf<Pair<String, Counts>>()
+    val rows = mutableListOf<DoseRow>()
+    val fmtDay = java.text.SimpleDateFormat("EEE, d MMM", java.util.Locale.getDefault())
+    val fmtFull = java.text.SimpleDateFormat("d MMM yyyy", java.util.Locale.getDefault())
+    var from = ""
+    var to = ""
+    for (d in days - 1 downTo 0) {
+        val cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_YEAR, -d)
+        if (d == days - 1) from = fmtFull.format(cal.time)
+        if (d == 0) to = fmtFull.format(cal.time)
+        val key = dayKey(cal)
+        val dc = Counts()
+        val dayRows = mutableListOf<DoseRow>()
+        for (m in meds) {
+            m.times.forEachIndexed { i, t ->
+                if (key < m.created || !applies(m, key, t)) return@forEachIndexed
+                val st = log["$key:${m.id}:$i"]
+                val label: String? = when {
+                    st == "T" -> "Taken"
+                    st == "S" -> "Not taken"
+                    d == 0 && t > now -> null
+                    else -> "Missed"
+                }
+                if (label != null) {
+                    val pm = perMed.getOrPut(m.id) { Counts() }
+                    for (x in listOf(total, dc, pm)) {
+                        when (label) {
+                            "Taken" -> x.t++
+                            "Not taken" -> x.s++
+                            else -> x.m++
+                        }
+                    }
+                    dayRows.add(DoseRow(fmtFull.format(cal.time), fmtDay.format(cal.time), t, m.name, m.dose, m.meal, label))
+                }
+            }
+        }
+        rows.addAll(dayRows.sortedBy { it.time })
+        perDay.add(Pair(fmtDay.format(cal.time), dc))
+    }
+    val byMed = meds.mapNotNull { m -> perMed[m.id]?.let { Pair(m.name, it) } }
+    return ReportData(days, from, to, total, byMed, perDay, rows)
+}
+
+// ---------- Export: PDF, CSV, plain text ----------
+object Exporter {
+    private fun pct(c: Counts) = if (c.total == 0) "-" else "${c.t * 100 / c.total}%"
+
+    // style: 2 = title, 1 = heading, 0 = normal
+    fun lines(c: Context, r: ReportData, detail: Boolean): List<Pair<String, Int>> {
+        val out = mutableListOf<Pair<String, Int>>()
+        out.add(Pair("Medicine Report", 2))
+        val who = Store.name(c)
+        if (who.isNotBlank()) out.add(Pair("Name: $who", 0))
+        out.add(Pair("Period: ${r.from} to ${r.to} (${r.days} days)", 0))
+        out.add(Pair("Generated: " + java.text.SimpleDateFormat("d MMM yyyy, h:mm a", java.util.Locale.getDefault()).format(java.util.Date()), 0))
+        out.add(Pair("", 0))
+        out.add(Pair("Summary", 1))
+        out.add(Pair("Taken: ${r.total.t}   Not taken: ${r.total.s}   Missed: ${r.total.m}   (Taken ${pct(r.total)})", 0))
+        out.add(Pair("", 0))
+        out.add(Pair("By medicine", 1))
+        for ((n, x) in r.perMed) out.add(Pair("$n:  Taken ${x.t}, Not taken ${x.s}, Missed ${x.m}", 0))
+        out.add(Pair("", 0))
+        out.add(Pair("By day", 1))
+        for ((n, x) in r.perDay) if (x.total > 0) out.add(Pair("$n:  Taken ${x.t}, Not taken ${x.s}, Missed ${x.m}", 0))
+        if (detail) {
+            out.add(Pair("", 0))
+            out.add(Pair("All doses", 1))
+            for (x in r.rows) {
+                val dose = if (x.dose.isBlank()) "" else " (${x.dose})"
+                out.add(Pair("${x.dateLabel}  ${fmt12(x.time)}  ${x.med}$dose - ${x.status}", 0))
+            }
+        }
+        out.add(Pair("", 0))
+        out.add(Pair("Personal log made with Medicine Reminder. Not medical advice.", 0))
+        out.add(Pair("Conceptualized & Designed by Faiz Anwar", 0))
+        return out
+    }
+
+    fun text(c: Context, r: ReportData): String = lines(c, r, false).joinToString("\n") { it.first }
+
+    private fun dir(c: Context): java.io.File {
+        val d = java.io.File(c.cacheDir, "exports")
+        d.mkdirs()
+        d.listFiles()?.forEach { it.delete() }
+        return d
+    }
+
+    fun csv(c: Context, r: ReportData): java.io.File {
+        val f = java.io.File(dir(c), "MedicineReport_${todayKey()}.csv")
+        fun q(s: String) = "\"" + s.replace("\"", "\"\"") + "\""
+        val sb = StringBuilder("﻿")
+        sb.append("Date,Time,Medicine,Dose,Meal rule,Status\n")
+        for (x in r.rows) {
+            sb.append(q(x.dateFull)).append(",").append(q(fmt12(x.time))).append(",").append(q(x.med)).append(",")
+                .append(q(x.dose)).append(",").append(q(mealText(x.meal))).append(",").append(q(x.status)).append("\n")
+        }
+        f.writeText(sb.toString(), Charsets.UTF_8)
+        return f
+    }
+
+    fun pdf(c: Context, r: ReportData): java.io.File {
+        val f = java.io.File(dir(c), "MedicineReport_${todayKey()}.pdf")
+        val w = 595
+        val h = 842
+        val m = 40f
+        val doc = PdfDocument()
+        val paint = Paint()
+        paint.isAntiAlias = true
+        var pageNo = 1
+        var page = doc.startPage(PdfDocument.PageInfo.Builder(w, h, pageNo).create())
+        var y = m
+        for ((text, style) in lines(c, r, true)) {
+            paint.textSize = when (style) { 2 -> 20f; 1 -> 13f; else -> 11f }
+            paint.typeface = if (style >= 1) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+            paint.color = if (style >= 1) Color.parseColor("#147D64") else Color.parseColor("#222222")
+            val lh = if (text.isEmpty()) 8f else paint.textSize + 6f
+            if (y + lh > h - m) {
+                doc.finishPage(page)
+                pageNo++
+                page = doc.startPage(PdfDocument.PageInfo.Builder(w, h, pageNo).create())
+                y = m
+            }
+            y += lh
+            if (text.isNotEmpty()) {
+                val n = paint.breakText(text, true, w - 2 * m, null)
+                page.canvas.drawText(text.substring(0, n), m, y, paint)
+            }
+        }
+        doc.finishPage(page)
+        java.io.FileOutputStream(f).use { doc.writeTo(it) }
+        doc.close()
+        return f
     }
 }
 
@@ -584,7 +843,7 @@ class MainActivity : Activity() {
         root.addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
 
-        if (Store.name(this).isBlank() && !Store.nameAsked(this)) askName()
+        if (!Store.noticeSeen(this)) showNotice() else if (Store.name(this).isBlank() && !Store.nameAsked(this)) askName()
     }
 
     override fun onResume() {
@@ -611,6 +870,19 @@ class MainActivity : Activity() {
         }
     }
 
+    // ----- First-run notice -----
+    private fun showNotice() {
+        AlertDialog.Builder(this)
+            .setTitle("Before you start")
+            .setMessage("Medicine Reminder is a reminder and personal log. It is not medical advice and does not replace your doctor or pharmacist. Always follow your doctor's instructions for your medicines.\n\nYour data stays on this phone.")
+            .setCancelable(false)
+            .setPositiveButton("I understand") { _, _ ->
+                Store.setNoticeSeen(this)
+                if (Store.name(this).isBlank() && !Store.nameAsked(this)) askName()
+            }
+            .show()
+    }
+
     // ----- Name -----
     private fun askName() {
         val e = EditText(this)
@@ -631,7 +903,20 @@ class MainActivity : Activity() {
     }
 
     // ----- Today -----
+    private fun addFooter() {
+        val f = tv("Conceptualized & Designed by Faiz Anwar", 12f, false, Color.parseColor("#6B7F78"))
+        f.gravity = Gravity.CENTER
+        add(f, 24)
+    }
+
     private fun renderToday() {
+        if (Store.feature(this, "quote", true)) {
+            val q = card()
+            q.background = roundBg(Color.parseColor("#E3F2EC"))
+            q.addView(tv("Thought for today", 12f, true, green))
+            q.addView(tv(Quotes.today(), 15f))
+            add(q, 8)
+        }
         val meds = Store.load(this)
         val key = todayKey()
         val log = Store.log(this)
@@ -644,6 +929,7 @@ class MainActivity : Activity() {
             t.gravity = Gravity.CENTER
             t.setPadding(dp(16), dp(48), dp(16), dp(16))
             add(t)
+            addFooter()
             return
         }
         val done = doses.count { log["$key:${it.second.id}:${it.third}"] == "T" }
@@ -677,6 +963,7 @@ class MainActivity : Activity() {
             }
             add(c)
         }
+        addFooter()
     }
 
     // ----- Medicines -----
@@ -737,7 +1024,7 @@ class MainActivity : Activity() {
     private fun renderReport() {
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
-        for ((label, days) in listOf(Pair("Last 7 days", 7), Pair("Last 30 days", 30))) {
+        for ((label, days) in listOf(Pair("7 days", 7), Pair("30 days", 30), Pair("90 days", 90))) {
             val b = Button(this)
             b.text = label
             b.isAllCaps = false
@@ -750,34 +1037,8 @@ class MainActivity : Activity() {
         }
         add(row, 8)
 
-        val meds = Store.load(this)
-        val log = Store.log(this)
-        val now = nowMinutes()
-        val total = Counts()
-        val perMed = LinkedHashMap<Int, Counts>()
-        val perDay = mutableListOf<Pair<String, Counts>>()
-        val fmt = java.text.SimpleDateFormat("EEE, d MMM", java.util.Locale.getDefault())
-        for (d in 0 until reportDays) {
-            val cal = Calendar.getInstance()
-            cal.add(Calendar.DAY_OF_YEAR, -d)
-            val key = dayKey(cal)
-            val dc = Counts()
-            for (m in meds) {
-                m.times.forEachIndexed { i, t ->
-                    if (key < m.created || !applies(m, key, t)) return@forEachIndexed
-                    val st = log["$key:${m.id}:$i"]
-                    val pm = perMed.getOrPut(m.id) { Counts() }
-                    when {
-                        st == "T" -> { total.t++; dc.t++; pm.t++ }
-                        st == "S" -> { total.s++; dc.s++; pm.s++ }
-                        d == 0 && t > now -> { }
-                        else -> { total.m++; dc.m++; pm.m++ }
-                    }
-                }
-            }
-            perDay.add(Pair(fmt.format(cal.time), dc))
-        }
-
+        val r = buildReport(this, reportDays)
+        val total = r.total
         val sum = card()
         val pct = if (total.total == 0) "-" else "${total.t * 100 / total.total}%"
         sum.addView(tv("Taken on time: $pct", 20f, true, green))
@@ -791,27 +1052,65 @@ class MainActivity : Activity() {
             return
         }
 
-        add(tv("By medicine", 16f, true), 16)
-        for (m in meds) {
-            val c = perMed[m.id] ?: continue
+        val ex = Button(this)
+        ex.text = "Export / Share report"
+        ex.isAllCaps = false
+        ex.setOnClickListener { showExport() }
+        add(ex)
+
+        add(tv("By medicine", 16f, true), 12)
+        for ((name, c) in r.perMed) {
             val card = card()
-            card.addView(tv(m.name, 16f, true))
+            card.addView(tv(name, 16f, true))
             card.addView(tv("✓ ${c.t}    ✗ ${c.s}    ! ${c.m}", 15f))
             add(card, 6)
         }
 
         add(tv("By day", 16f, true), 16)
         val days = card()
-        for ((label, c) in perDay) {
+        for ((label, c) in r.perDay.reversed()) {
             if (c.total == 0) continue
-            val r = LinearLayout(this)
-            r.orientation = LinearLayout.HORIZONTAL
-            r.addView(tv(label, 15f), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            r.addView(tv("✓ ${c.t}   ✗ ${c.s}   ! ${c.m}", 15f))
-            r.setPadding(0, dp(4), 0, dp(4))
-            days.addView(r)
+            val line = LinearLayout(this)
+            line.orientation = LinearLayout.HORIZONTAL
+            line.addView(tv(label, 15f), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            line.addView(tv("✓ ${c.t}   ✗ ${c.s}   ! ${c.m}", 15f))
+            line.setPadding(0, dp(4), 0, dp(4))
+            days.addView(line)
         }
         add(days, 6)
+    }
+
+    private fun showExport() {
+        AlertDialog.Builder(this)
+            .setTitle("Export last $reportDays days")
+            .setItems(arrayOf("PDF (to print or show a doctor)", "CSV (Excel / Google Sheets)", "Plain text (for WhatsApp / SMS)")) { _, w ->
+                try {
+                    val r = buildReport(this, reportDays)
+                    when (w) {
+                        0 -> shareFile(Exporter.pdf(this, r), "application/pdf")
+                        1 -> shareFile(Exporter.csv(this, r), "text/csv")
+                        else -> {
+                            val i = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, Exporter.text(this, r))
+                            startActivity(Intent.createChooser(i, "Share report"))
+                        }
+                    }
+                } catch (e: Exception) {
+                    Toast.makeText(this, "Could not create the report", Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun shareFile(f: java.io.File, mime: String) {
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", f)
+        val i = Intent(Intent.ACTION_SEND)
+        i.type = mime
+        i.putExtra(Intent.EXTRA_STREAM, uri)
+        i.clipData = ClipData.newRawUri("", uri)
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        startActivity(Intent.createChooser(i, "Share report"))
+        Toast.makeText(this, "This report contains health information. Share it carefully.", Toast.LENGTH_LONG).show()
     }
 
     // ----- Settings -----
@@ -855,7 +1154,23 @@ class MainActivity : Activity() {
         rc.addView(rb)
         add(rc)
 
-        add(tv("Medicine Reminder v1.3", 12f, false, Color.GRAY), 16)
+        val fc = card()
+        fc.addView(tv("Features", 16f, true))
+        val sw = Switch(this)
+        sw.text = "Daily health quote on Today screen"
+        sw.isChecked = Store.feature(this, "quote", true)
+        sw.setOnCheckedChangeListener { _, on -> Store.setFeature(this, "quote", on) }
+        fc.addView(sw)
+        fc.addView(tv("More options (water, blood pressure, BMI) are coming in the next update.", 12f, false, Color.GRAY))
+        add(fc)
+
+        val ab = card()
+        ab.addView(tv("About", 16f, true))
+        ab.addView(tv("Medicine Reminder v1.4", 13f, false, Color.GRAY))
+        ab.addView(tv("Conceptualized & Designed by", 14f))
+        ab.addView(tv("Faiz Anwar", 18f, true, green))
+        ab.addView(tv("A reminder and personal log. Not medical advice; it does not replace your doctor or pharmacist. Your data stays on this phone.", 12f, false, Color.GRAY))
+        add(ab)
     }
 
     // ----- Permissions -----
@@ -944,7 +1259,7 @@ class MainActivity : Activity() {
                 0 -> "Empty stomach: 1 hour before a meal."
                 1 -> "After meal: 30 minutes after a meal."
                 else -> "Anytime: at meal time."
-            } + "\nMedicines are kept at least ${Suggest.GAP} minutes apart."
+            } + "\nMedicines are kept at least ${Suggest.GAP} minutes apart.\nThese are only suggestions - follow your doctor's or pharmacist's instructions."
         note.setPadding(0, 0, 0, dp(8))
         p.addView(note)
         for (i in times.indices) {

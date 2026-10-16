@@ -10,8 +10,8 @@ android {
         applicationId = "com.faiz.medicinereminder"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.3"
+        versionCode = 6
+        versionName = "1.4"
     }
     signingConfigs {
         getByName("debug") {
@@ -26,4 +26,8 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+}
+
+dependencies {
+    implementation("androidx.core:core:1.13.1")
 }

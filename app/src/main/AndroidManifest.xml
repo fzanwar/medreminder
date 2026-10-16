@@ -12,6 +12,13 @@
             </intent-filter>
         </activity>
         <activity android:name=".AlarmActivity" android:exported="false" android:launchMode="singleTask" android:taskAffinity="" android:excludeFromRecents="true" android:showWhenLocked="true" android:turnScreenOn="true" />
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.faiz.medicinereminder.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
+        </provider>
         <receiver android:name=".ReminderReceiver" android:exported="false" />
         <receiver android:name=".BootReceiver" android:enabled="true" android:exported="false">
             <intent-filter>
