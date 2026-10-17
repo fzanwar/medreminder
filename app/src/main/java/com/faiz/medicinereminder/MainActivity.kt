@@ -427,6 +427,20 @@ fun buildReport(c: Context, days: Int): ReportData {
         )
         extras.add(Extra("Water", lines, emptyList()))
     }
+    if (Steps.on(c)) {
+        val h = Steps.hist(c)
+        val vals = (0 until days).map { d ->
+            val cal = Calendar.getInstance()
+            cal.add(Calendar.DAY_OF_YEAR, -d)
+            h.optInt(dayKey(cal), 0)
+        }.filter { it > 0 }
+        val lines = if (vals.isEmpty()) listOf("No steps recorded in this period.") else listOf(
+            "Average: ${vals.sum() / vals.size} steps per day",
+            "Best day: ${vals.max()} steps",
+            "Target ${Steps.target(c)} reached on ${vals.count { it >= Steps.target(c) }} of ${vals.size} days"
+        )
+        extras.add(Extra("Steps", lines, emptyList()))
+    }
     if (Bp.on(c)) {
         val start = Calendar.getInstance()
         start.add(Calendar.DAY_OF_YEAR, -(days - 1))
@@ -486,7 +500,7 @@ object Exporter {
         }
         out.add(Pair("", 0))
         out.add(Pair("Personal log made with Medicine Reminder. Not medical advice.", 0))
-        out.add(Pair("Conceptualized & Designed by Faiz Anwar", 0))
+        out.add(Pair("Created by Faiz Anwar", 0))
         return out
     }
 
@@ -705,6 +719,7 @@ class ReminderReceiver : BroadcastReceiver() {
         when (intent.action) {
             Scheduler.TAKEN, Scheduler.SKIP, Scheduler.SNOOZE -> Scheduler.handle(context, intent.action!!, id, idx)
             HealthAlarms.WATER_FIRE, HealthAlarms.WATER_ADD, HealthAlarms.WATER_SNOOZE, HealthAlarms.BP_FIRE -> HealthAlarms.onReceive(context, intent)
+            HealthAlarms.STEPS_READ, HealthAlarms.STEPS_NUDGE -> HealthAlarms.onReceive(context, intent, goAsync())
             else -> {
                 val m = Store.load(context).firstOrNull { it.id == id } ?: return
                 if (idx >= m.times.size) return
@@ -890,6 +905,9 @@ class MainActivity : Activity() {
     private lateinit var tabBar: LinearLayout
     private lateinit var subtitle: TextView
     private var tab = "Today"
+    private lateinit var scroll: ScrollView
+    private var pausedAt = 0L
+    private val blinkers = mutableListOf<android.animation.ObjectAnimator>()
     private var reportDays = 7
     private var askedNotif = false
     private var askedExact = false
@@ -1008,7 +1026,7 @@ class MainActivity : Activity() {
         body.orientation = LinearLayout.VERTICAL
         body.setBackgroundColor(Color.parseColor("#F3F7F5"))
 
-        val scroll = ScrollView(this)
+        scroll = ScrollView(this)
         content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
         content.setPadding(dp(12), dp(4), dp(12), dp(24))
@@ -1026,9 +1044,31 @@ class MainActivity : Activity() {
         if (!Store.noticeSeen(this)) showNotice() else if (Store.name(this).isBlank() && !Store.nameAsked(this)) askName()
     }
 
+    override fun onPause() {
+        super.onPause()
+        pausedAt = System.currentTimeMillis()
+        stopBlink()
+    }
+
+    private fun stopBlink() {
+        for (a in blinkers) a.cancel()
+        blinkers.clear()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 77) {
+            Steps.readOnce(this) { if (!isFinishing) render() }
+            HealthAlarms.scheduleAll(this)
+            render()
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         render()
+        if (pausedAt > 0 && System.currentTimeMillis() - pausedAt > 20_000) scroll.post { scroll.scrollTo(0, 0) }
+        if (Steps.on(this)) Steps.readOnce(this) { if (!isFinishing) render() }
         Scheduler.scheduleAll(this)
         checkSetup()
         if (Updater.enabled(this) && Updater.dueForCheck(this)) {
@@ -1060,9 +1100,11 @@ class MainActivity : Activity() {
             t.setOnClickListener {
                 tab = n
                 render()
+                scroll.post { scroll.scrollTo(0, 0) }
             }
             tabBar.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
+        stopBlink()
         content.removeAllViews()
         when (tab) {
             "Today" -> renderToday()
@@ -1106,7 +1148,7 @@ class MainActivity : Activity() {
 
     // ----- Today -----
     private fun addFooter() {
-        val f = tv("Conceptualized & Designed by Faiz Anwar", 12f, false, gray)
+        val f = tv("Created by Faiz Anwar", 12f, false, gray)
         f.gravity = Gravity.CENTER
         add(f, 24)
     }
@@ -1133,6 +1175,7 @@ class MainActivity : Activity() {
             add(q, 8)
         }
         if (Water.on(this)) renderWaterCard()
+        if (Steps.on(this)) renderStepsCard()
 
         val meds = Store.load(this)
         val key = todayKey()
@@ -1152,20 +1195,35 @@ class MainActivity : Activity() {
         val done = doses.count { log["$key:${it.second.id}:${it.third}"] == "T" }
         add(tv("Today: $done of ${doses.size} taken", 16f, true, green), 12)
         add(tv("Tap a dose to mark it taken or not taken.", 13f, false, Color.GRAY), 2)
+        val nextDose = doses.firstOrNull { it.first > now && log["$key:${it.second.id}:${it.third}"] == null }
+        val nextKey = nextDose?.let { "${it.second.id}:${it.third}" }
         for ((t, m, i) in doses) {
             val st = log["$key:${m.id}:$i"]
             val col = medColor(m.name)
             val (outer, c) = stripeCard(col)
             val title = tv(colored("● ${fmt12(t)}", "   ${m.name}" + if (m.dose.isNotBlank()) "  (${m.dose})" else "", col), 17f, true)
             c.addView(title)
-            c.addView(tv(mealLabel(m.meal), 13f, false, Color.GRAY))
             val (label, scol) = when {
                 st == "T" -> Pair("✓ Taken", "#1B8A5A")
                 st == "S" -> Pair("✗ Not taken", "#B23B3B")
                 t > now -> Pair("Upcoming", "#666666")
-                else -> Pair("! Not marked - tap to update", "#C98A12")
+                else -> Pair("! Not marked", "#C98A12")
             }
-            c.addView(tv(label, 15f, true, Color.parseColor(scol)))
+            val line = LinearLayout(this)
+            line.orientation = LinearLayout.HORIZONTAL
+            line.addView(tv(mealLabel(m.meal), 13f, false, Color.GRAY), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            val stv = tv(label, 14f, true, Color.parseColor(scol))
+            stv.gravity = Gravity.END
+            line.addView(stv)
+            c.addView(line)
+            if (nextKey == "${m.id}:$i") {
+                val a = android.animation.ObjectAnimator.ofFloat(outer, "alpha", 1f, 0.45f)
+                a.duration = 700
+                a.repeatMode = android.animation.ValueAnimator.REVERSE
+                a.repeatCount = android.animation.ValueAnimator.INFINITE
+                a.start()
+                blinkers.add(a)
+            }
             outer.setOnClickListener {
                 AlertDialog.Builder(this)
                     .setTitle("${m.name} - ${fmt12(t)}")
@@ -1232,6 +1290,34 @@ class MainActivity : Activity() {
                 }.setNegativeButton("Cancel", null).show()
         }
         c.addView(row)
+        add(c, 8)
+    }
+
+    private fun renderStepsCard() {
+        val green2 = Color.parseColor("#1F8A5B")
+        val c = card()
+        c.addView(tv("Steps", 16f, true, green2))
+        if (!Steps.hasSensor(this)) {
+            c.addView(tv("This phone has no step sensor.", 14f, false, gray))
+        } else if (!Steps.hasPermission(this)) {
+            c.addView(tv("Allow \"Physical activity\" to count your steps.", 14f))
+            c.addView(button("Allow") { requestPermissions(arrayOf(android.Manifest.permission.ACTIVITY_RECOGNITION), 77) })
+        } else {
+            val got = Steps.today(this)
+            val goal = Steps.goal(this)
+            c.addView(tv(String.format("%,d of %,d steps", got, goal) + if (got >= goal) "   Goal reached!" else "", 15f))
+            val pct = minOf(100, got * 100 / maxOf(goal, 1))
+            val bar = LinearLayout(this)
+            bar.background = roundBg(Color.parseColor("#DCEFE6"), 6)
+            val fill = View(this)
+            fill.background = roundBg(green2, 6)
+            bar.addView(fill, LinearLayout.LayoutParams(0, dp(12), pct.toFloat()))
+            bar.addView(View(this), LinearLayout.LayoutParams(0, dp(12), (100 - pct).toFloat()))
+            val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(12))
+            lp.topMargin = dp(8)
+            c.addView(bar, lp)
+            c.addView(tv("Counted by the phone, updated when you open the app and about every hour.", 11f, false, gray))
+        }
         add(c, 8)
     }
 
@@ -1303,49 +1389,86 @@ class MainActivity : Activity() {
 
         val r = buildReport(this, reportDays)
         val total = r.total
+        val okC = Color.parseColor("#1B8A5A")
+        val noC = Color.parseColor("#B23B3B")
+        val missC = Color.parseColor("#E0A526")
+        fun stack(c: Counts, h: Int): LinearLayout {
+            val b = LinearLayout(this)
+            b.background = roundBg(Color.parseColor("#E3EAE7"), 5)
+            b.clipToOutline = true
+            val tt = maxOf(c.total, 1).toFloat()
+            for ((n, col) in listOf(Pair(c.t, okC), Pair(c.s, noC), Pair(c.m, missC))) {
+                if (n > 0) {
+                    val v = View(this)
+                    v.setBackgroundColor(col)
+                    b.addView(v, LinearLayout.LayoutParams(0, dp(h), n / tt * 100f))
+                }
+            }
+            if (c.total == 0) b.addView(View(this), LinearLayout.LayoutParams(0, dp(h), 1f))
+            return b
+        }
         val sum = card()
-        val pct = if (total.total == 0) "-" else "${total.t * 100 / total.total}%"
-        sum.addView(tv("Taken on time: $pct", 20f, true, green))
-        sum.addView(tv("✓ Taken: ${total.t}", 16f, false, Color.parseColor("#1B8A5A")))
-        sum.addView(tv("✗ Not taken (skipped): ${total.s}", 16f, false, Color.parseColor("#B23B3B")))
-        sum.addView(tv("! Missed (no answer): ${total.m}", 16f, false, Color.parseColor("#C98A12")))
+        val pctN = if (total.total == 0) 0 else total.t * 100 / total.total
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        top.gravity = Gravity.CENTER_VERTICAL
+        top.addView(Ring(this, pctN, okC), LinearLayout.LayoutParams(dp(96), dp(96)))
+        val tx = LinearLayout(this)
+        tx.orientation = LinearLayout.VERTICAL
+        tx.setPadding(dp(16), 0, 0, 0)
+        tx.addView(tv("Taken on time", 13f, false, gray))
+        tx.addView(tv("✓ Taken: ${total.t}", 16f, true, okC))
+        tx.addView(tv("✗ Not taken: ${total.s}", 16f, true, noC))
+        tx.addView(tv("! Missed: ${total.m}", 16f, true, Color.parseColor("#C98A12")))
+        top.addView(tx)
+        sum.addView(top)
+        val sl = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        sl.topMargin = dp(12)
+        sum.addView(stack(total, 14), sl)
+        sum.addView(tv("Green = taken, red = not taken, amber = missed", 11f, false, gray))
         add(sum)
+
+        if (total.total == 0) {
+            add(tv("No dose records yet. The report fills up as you mark your doses.", 14f, false, Color.GRAY))
+        } else {
+            add(tv("By medicine", 16f, true), 14)
+            for ((name, c) in r.perMed) {
+                val col = medColor(name)
+                val (outer, body) = stripeCard(col)
+                body.addView(tv(colored("● ", name, col), 16f, true))
+                val bl = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                bl.topMargin = dp(6)
+                body.addView(stack(c, 10), bl)
+                body.addView(tv("✓ ${c.t}    ✗ ${c.s}    ! ${c.m}    (${if (c.total == 0) 0 else c.t * 100 / c.total}% taken)", 13f))
+                add(outer, 6)
+            }
+
+            add(tv("Day by day", 16f, true), 16)
+            val days = card()
+            for ((label, c) in r.perDay.reversed()) {
+                if (c.total == 0) continue
+                val line = LinearLayout(this)
+                line.orientation = LinearLayout.HORIZONTAL
+                line.gravity = Gravity.CENTER_VERTICAL
+                line.setPadding(0, dp(5), 0, dp(5))
+                line.addView(tv(label, 13f), LinearLayout.LayoutParams(dp(92), ViewGroup.LayoutParams.WRAP_CONTENT))
+                line.addView(stack(c, 12), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                val ct = tv("${c.t}/${c.total}", 13f, true, if (c.t == c.total) okC else ink)
+                ct.gravity = Gravity.END
+                line.addView(ct, LinearLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.WRAP_CONTENT))
+                days.addView(line)
+            }
+            add(days, 6)
+        }
 
         for (e in r.extras) {
             val ec = card()
             ec.addView(tv(e.title, 16f, true))
             for (l in e.summary) ec.addView(tv(l, 14f))
-            add(ec)
+            add(ec, 10)
         }
 
-        if (total.total == 0) {
-            add(tv("No dose records yet. The report fills up as you mark your doses.", 14f, false, Color.GRAY))
-            return
-        }
-
-        add(button("Export / Share report") { showExport() })
-
-        add(tv("By medicine", 16f, true), 12)
-        for ((name, c) in r.perMed) {
-            val col = medColor(name)
-            val (outer, body) = stripeCard(col)
-            body.addView(tv(colored("● ", name, col), 16f, true))
-            body.addView(tv("✓ ${c.t}    ✗ ${c.s}    ! ${c.m}", 15f))
-            add(outer, 6)
-        }
-
-        add(tv("By day", 16f, true), 16)
-        val days = card()
-        for ((label, c) in r.perDay.reversed()) {
-            if (c.total == 0) continue
-            val line = LinearLayout(this)
-            line.orientation = LinearLayout.HORIZONTAL
-            line.addView(tv(label, 15f), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            line.addView(tv("✓ ${c.t}   ✗ ${c.s}   ! ${c.m}", 15f))
-            line.setPadding(0, dp(4), 0, dp(4))
-            days.addView(line)
-        }
-        add(days, 6)
+        if (total.total > 0 || r.extras.isNotEmpty()) add(button("Export / Share report") { showExport() }, 16)
     }
 
     private fun showExport() {
@@ -1611,12 +1734,16 @@ class MainActivity : Activity() {
         feature("Water reminders", "water", false)
         feature("Blood pressure tracker", "bp", false)
         feature("BMI and ideal weight", "bmi", false)
+        feature("Step counter", "steps", false) {
+            if (Store.feature(this, "steps", false) && !Steps.hasPermission(this))
+                requestPermissions(arrayOf(android.Manifest.permission.ACTIVITY_RECOGNITION), 77)
+        }
         feature("Check for app updates (uses internet)", "updatecheck", true)
-        fc.addView(tv("Coming next: step counter.", 12f, false, gray))
         add(fc)
 
         if (Water.on(this)) addWaterSettings()
         if (Bp.on(this)) addBpSettings()
+        if (Steps.on(this)) addStepSettings()
 
         val uc = card()
         uc.addView(tv("App version", 16f, true))
@@ -1641,7 +1768,7 @@ class MainActivity : Activity() {
         val ab = card()
         ab.addView(tv("About", 16f, true))
         ab.addView(tv("Medicine Reminder v${Updater.installedName(this)}", 13f, false, Color.GRAY))
-        ab.addView(tv("Conceptualized & Designed by", 14f))
+        ab.addView(tv("Created by", 14f))
         ab.addView(tv("Faiz Anwar", 18f, true, green))
         ab.addView(tv("A reminder and personal log. Not medical advice; it does not replace your doctor or pharmacist. Your health data stays on this phone. The internet is used only to check for new versions, if you leave that switch on.", 12f, false, Color.GRAY))
         add(ab)
@@ -1654,17 +1781,24 @@ class MainActivity : Activity() {
         val weight = numberField("Weight (kg) - to suggest a goal", if (savedW > 0) String.format("%.0f", savedW.toDouble()) else "", true)
         val goal = numberField("Daily goal (ml)", Water.goal(this).toString())
         val glass = numberField("Glass size (ml) - 250 is common, or your own", Water.glass(this).toString())
+        c.addView(tv("Your weight (kg)", 13f, true))
+        c.addView(tv("Used only to suggest a daily goal.", 12f, false, gray))
         c.addView(weight)
         c.addView(button("Suggest goal from weight") {
             val kg = num(weight)
             if (kg != null && kg in 20.0..300.0) goal.setText((Math.round(kg * 33 / 50.0) * 50).toString())
             else Toast.makeText(this, "Enter your weight first", Toast.LENGTH_SHORT).show()
         })
+        c.addView(tv("Daily goal (ml)", 13f, true))
+        c.addView(tv("Total water you want to drink in a day. 1000 ml = 1 litre.", 12f, false, gray))
         c.addView(goal)
+        c.addView(tv("Glass size (ml)", 13f, true))
+        c.addView(tv("How much one tap on + adds. A normal glass is 250 ml.", 12f, false, gray))
         c.addView(glass)
         c.addView(tv("A common guide is about 30-35 ml per kg a day. Heat, exercise and illness raise it. If you have a kidney, heart or liver condition, or your doctor limits fluids, use your doctor's number.", 12f, false, gray))
 
         c.addView(tv("Reminder style", 14f, true))
+        c.addView(tv("Every 2 hours: a fixed reminder. Spread: reminders sized to reach your goal between wake and sleep time.", 12f, false, gray))
         val rg = RadioGroup(this)
         val r0 = RadioButton(this)
         r0.text = "Every 2 hours"
@@ -1697,6 +1831,8 @@ class MainActivity : Activity() {
                 sb.text = "Sleep time: ${fmt12(sleep)}"
             }, sleep / 60, sleep % 60, false).show()
         }
+        c.addView(tv("Wake-up and sleep time", 13f, true))
+        c.addView(tv("Reminders only come between these two times. Keep at least 2 hours apart.", 12f, false, gray))
         c.addView(wb)
         c.addView(sb)
         c.addView(button("Save water settings") {
@@ -1713,6 +1849,52 @@ class MainActivity : Activity() {
                 render()
             }
         })
+        add(c)
+    }
+
+    private fun addStepSettings() {
+        val c = card()
+        val g = Color.parseColor("#1F8A5B")
+        c.addView(tv("Step settings", 16f, true, g))
+        c.addView(tv("Daily step target (now ${String.format("%,d", Steps.target(this))})", 14f, true))
+        c.addView(tv("Pick a target that suits you. Start low if you are not active now. Any steady increase is good.", 12f, false, gray))
+        val row = LinearLayout(this)
+        for (v in listOf(4000, 6000, 8000, 10000)) {
+            row.addView(button("${v / 1000}k") {
+                Steps.setTarget(this, v)
+                HealthAlarms.scheduleAll(this)
+                render()
+            }.also { it.alpha = if (Steps.target(this) == v) 1f else 0.5f }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        c.addView(row)
+        val e = numberField("Or type your own target", "")
+        c.addView(e)
+        c.addView(button("Save my target") {
+            val v = num(e)?.toInt()
+            if (v == null || v !in 1000..30000) Toast.makeText(this, "Enter a number between 1,000 and 30,000", Toast.LENGTH_LONG).show()
+            else {
+                Steps.setTarget(this, v)
+                render()
+            }
+        })
+        val sw = Switch(this)
+        sw.text = "Build up gradually"
+        sw.isChecked = Steps.gradual(this)
+        sw.setOnCheckedChangeListener { _, on ->
+            Store.setFeature(this, "st_grad", on)
+            render()
+        }
+        c.addView(sw)
+        c.addView(tv("Today's goal is about 12% above your recent average, up to your target (now ${String.format("%,d", Steps.goal(this))}).", 12f, false, gray))
+        val sw2 = Switch(this)
+        sw2.text = "Evening nudge at 7 PM if the goal is not met"
+        sw2.isChecked = Steps.nudge(this)
+        sw2.setOnCheckedChangeListener { _, on ->
+            Store.setFeature(this, "st_nudge", on)
+            HealthAlarms.scheduleAll(this)
+        }
+        c.addView(sw2)
+        c.addView(tv("Steps are counted by your phone's own sensor. Nothing is sent anywhere. If you have a health condition, ask your doctor what is right for you.", 12f, false, gray))
         add(c)
     }
 

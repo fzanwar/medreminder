@@ -304,6 +304,10 @@ object HealthAlarms {
     const val WATER_ADD = "com.faiz.medicinereminder.WATER_ADD"
     const val WATER_SNOOZE = "com.faiz.medicinereminder.WATER_SNOOZE"
     const val BP_FIRE = "com.faiz.medicinereminder.BP_FIRE"
+    const val STEPS_READ = "com.faiz.medicinereminder.STEPS_READ"
+    const val STEPS_NUDGE = "com.faiz.medicinereminder.STEPS_NUDGE"
+    private const val CH_STEPS = "steps_v1"
+    private const val NID_STEPS = 92_000_002
     private const val CH_WATER = "water_v1"
     private const val CH_BP = "bp_v1"
     private const val NID_WATER = 92_000_000
@@ -312,7 +316,7 @@ object HealthAlarms {
     private fun am(c: Context) = c.getSystemService(Context.ALARM_SERVICE) as AlarmManager
 
     private fun pi(c: Context, action: String, slot: Int, snooze: Boolean): PendingIntent {
-        val base = if (action == BP_FIRE) 91_000_000 else 90_000_000
+        val base = when (action) { BP_FIRE -> 91_000_000; STEPS_READ -> 94_000_000; STEPS_NUDGE -> 94_000_001; else -> 90_000_000 }
         val i = Intent(c, ReminderReceiver::class.java).setAction(action).putExtra("slot", slot).putExtra("snooze", snooze)
         return PendingIntent.getBroadcast(c, base + slot + if (snooze) 100 else 0, i, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     }
@@ -336,6 +340,21 @@ object HealthAlarms {
         for (s in 0..1) am(c).cancel(pi(c, BP_FIRE, s, false))
         if (Water.on(c)) Water.slots(c).forEachIndexed { i, t -> set(c, WATER_FIRE, i, Scheduler.nextTrigger(t), false) }
         if (Bp.on(c) && Bp.remind(c)) for (i in 0..1) set(c, BP_FIRE, i, Scheduler.nextTrigger(Bp.time(c, i)), false)
+        am(c).cancel(pi(c, STEPS_READ, 0, false))
+        am(c).cancel(pi(c, STEPS_NUDGE, 0, false))
+        if (Steps.on(c)) {
+            set(c, STEPS_READ, 0, nextHour(), false)
+            if (Steps.nudge(c)) set(c, STEPS_NUDGE, 0, Scheduler.nextTrigger(19 * 60), false)
+        }
+    }
+
+    private fun nextHour(): Long {
+        val cal = Calendar.getInstance()
+        cal.add(Calendar.HOUR_OF_DAY, 1)
+        cal.set(Calendar.MINUTE, 0)
+        cal.set(Calendar.SECOND, 5)
+        cal.set(Calendar.MILLISECOND, 0)
+        return cal.timeInMillis
     }
 
     private fun channels(c: Context) {
@@ -348,12 +367,39 @@ object HealthAlarms {
         nm.createNotificationChannel(b)
     }
 
-    fun onReceive(c: Context, i: Intent) {
+    fun onReceive(c: Context, i: Intent, pr: android.content.BroadcastReceiver.PendingResult? = null) {
         val slot = i.getIntExtra("slot", 0)
         val snooze = i.getBooleanExtra("snooze", false)
         val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         when (i.action) {
+            STEPS_READ -> {
+                if (!Steps.on(c)) { pr?.finish(); return }
+                set(c, STEPS_READ, 0, nextHour(), false)
+                Steps.readOnce(c) { pr?.finish() }
+            }
+            STEPS_NUDGE -> {
+                if (!Steps.on(c) || !Steps.nudge(c)) { pr?.finish(); return }
+                set(c, STEPS_NUDGE, 0, Scheduler.nextTrigger(19 * 60), false)
+                Steps.readOnce(c) {
+                    val got = Steps.today(c)
+                    val goal = Steps.goal(c)
+                    if (got < goal) {
+                        val ch = NotificationChannel(CH_STEPS, "Step reminders", NotificationManager.IMPORTANCE_DEFAULT)
+                        nm.createNotificationChannel(ch)
+                        val n = Notification.Builder(c, CH_STEPS)
+                            .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                            .setContentTitle("A short walk this evening?")
+                            .setContentText(String.format("%,d of %,d steps so far", got, goal))
+                            .setColor(Color.parseColor("#1F8A5B"))
+                            .setAutoCancel(true)
+                            .setContentIntent(PendingIntent.getActivity(c, 5, Intent(c, MainActivity::class.java), flags))
+                            .build()
+                        nm.notify(NID_STEPS, n)
+                    }
+                    pr?.finish()
+                }
+            }
             WATER_ADD -> {
                 nm.cancel(NID_WATER)
                 val v = Water.add(c, Water.glass(c))
@@ -408,5 +454,121 @@ object HealthAlarms {
                 nm.notify(NID_BP, n)
             }
         }
+    }
+}
+
+// ---------- Report visuals ----------
+class Ring(c: Context, private val pct: Int, private val col: Int) : View(c) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    override fun onDraw(cv: Canvas) {
+        val w = width.toFloat()
+        val s = w * 0.12f
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = s
+        p.color = Color.parseColor("#E3EAE7")
+        val r = android.graphics.RectF(s, s, w - s, height - s)
+        cv.drawArc(r, 0f, 360f, false, p)
+        p.color = col
+        p.strokeCap = Paint.Cap.ROUND
+        cv.drawArc(r, -90f, 360f * pct / 100f, false, p)
+        p.style = Paint.Style.FILL
+        p.textAlign = Paint.Align.CENTER
+        p.textSize = w * 0.26f
+        p.typeface = android.graphics.Typeface.DEFAULT_BOLD
+        cv.drawText("$pct%", w / 2, height / 2 + p.textSize / 3, p)
+    }
+}
+
+// ---------- Steps ----------
+object Steps {
+    fun on(c: Context) = Store.feature(c, "steps", false)
+    fun target(c: Context) = Store.prefs(c).getInt("st_target", 6000)
+    fun setTarget(c: Context, v: Int) = Store.prefs(c).edit().putInt("st_target", v).apply()
+    fun gradual(c: Context) = Store.feature(c, "st_grad", false)
+    fun nudge(c: Context) = Store.feature(c, "st_nudge", true)
+
+    fun hasSensor(c: Context): Boolean {
+        val sm = c.getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        return sm.getDefaultSensor(android.hardware.Sensor.TYPE_STEP_COUNTER) != null
+    }
+
+    fun hasPermission(c: Context) = Build.VERSION.SDK_INT < 29 ||
+        c.checkSelfPermission(android.Manifest.permission.ACTIVITY_RECOGNITION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    fun hist(c: Context): JSONObject = try { JSONObject(Store.prefs(c).getString("st_hist", "{}")!!) } catch (_: Exception) { JSONObject() }
+
+    fun today(c: Context) = hist(c).optInt(todayKey(), 0)
+
+    fun forDay(c: Context, key: String) = hist(c).optInt(key, 0)
+
+    // Goal for today. With "gradual" on, it climbs about 12% above your recent average, up to your target.
+    fun goal(c: Context): Int {
+        val t = target(c)
+        if (!gradual(c)) return t
+        val h = hist(c)
+        var sum = 0
+        var n = 0
+        for (d in 1..7) {
+            val cal = Calendar.getInstance()
+            cal.add(Calendar.DAY_OF_YEAR, -d)
+            val v = h.optInt(dayKey(cal), 0)
+            if (v > 0) {
+                sum += v
+                n++
+            }
+        }
+        if (n == 0) return minOf(t, 2000)
+        val g = ((sum / n) * 1.12 / 100).toInt() * 100
+        return g.coerceIn(minOf(t, 2000), t)
+    }
+
+    @Synchronized
+    fun record(c: Context, counter: Float) {
+        val p = Store.prefs(c)
+        val last = p.getFloat("st_last", -1f)
+        val lastDay = p.getString("st_day", null)
+        val h = hist(c)
+        if (last >= 0f && lastDay != null) {
+            val delta = if (counter >= last) counter - last else counter
+            h.put(lastDay, h.optInt(lastDay, 0) + delta.toInt())
+        }
+        val keys = h.keys().asSequence().toList().sorted()
+        if (keys.size > 120) for (k in keys.take(keys.size - 120)) h.remove(k)
+        p.edit().putFloat("st_last", counter).putString("st_day", todayKey()).putString("st_hist", h.toString()).apply()
+    }
+
+    // Takes one reading from the phone's step sensor, then stops listening.
+    fun readOnce(c: Context, done: () -> Unit) {
+        if (!on(c) || !hasPermission(c)) {
+            done()
+            return
+        }
+        val sm = c.getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val s = sm.getDefaultSensor(android.hardware.Sensor.TYPE_STEP_COUNTER)
+        if (s == null) {
+            done()
+            return
+        }
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        var finished = false
+        lateinit var l: android.hardware.SensorEventListener
+        fun finish() {
+            if (finished) return
+            finished = true
+            try {
+                sm.unregisterListener(l)
+            } catch (_: Exception) {
+            }
+            done()
+        }
+        l = object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(e: android.hardware.SensorEvent) {
+                record(c, e.values[0])
+                finish()
+            }
+            override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+        }
+        sm.registerListener(l, s, android.hardware.SensorManager.SENSOR_DELAY_NORMAL)
+        handler.postDelayed({ finish() }, 4000)
     }
 }

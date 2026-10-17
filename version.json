@@ -1,6 +1,1 @@
-{
-  "versionCode": 7,
-  "versionName": "1.5",
-  "url": "https://github.com/fzanwar/medreminder/releases/latest",
-  "notes": "Water reminders, blood pressure tracker, BMI, medicine colours, update check."
-}
+{"versionCode":8,"versionName":"1.6","url":"https://github.com/fzanwar/medreminder/releases/latest","notes":"Step counter, visual report, compact Today cards, blinking next dose, water hints."}
