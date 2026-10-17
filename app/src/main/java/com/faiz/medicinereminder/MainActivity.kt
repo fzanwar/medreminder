@@ -25,6 +25,9 @@ import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.text.InputType
+import android.text.SpannableString
+import android.text.style.ForegroundColorSpan
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -36,6 +39,8 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
@@ -85,7 +90,7 @@ fun fmt12(min: Int): String {
 fun applies(m: Med, key: String, t: Int) = !(key == m.created && t < m.createdMin)
 
 object Store {
-    private fun prefs(c: Context) = c.getSharedPreferences("medicines", Context.MODE_PRIVATE)
+    fun prefs(c: Context) = c.getSharedPreferences("medicines", Context.MODE_PRIVATE)
 
     fun load(c: Context): MutableList<Med> {
         val out = mutableListOf<Med>()
@@ -161,6 +166,76 @@ object Store {
     fun name(c: Context): String = prefs(c).getString("name", "") ?: ""
     fun setName(c: Context, n: String) { prefs(c).edit().putString("name", n.trim()).putBoolean("nameAsked", true).apply() }
     fun nameAsked(c: Context): Boolean = prefs(c).getBoolean("nameAsked", false)
+
+    // ----- medicine colours (same name = same colour) -----
+    private fun colorMap(c: Context): JSONObject =
+        try { JSONObject(prefs(c).getString("colors", "{}")) } catch (_: Exception) { JSONObject() }
+
+    private fun usedColors(c: Context, o: JSONObject): Set<Int> =
+        load(c).map { it.name.trim().lowercase() }.filter { o.has(it) }.map { o.getInt(it) }.toSet()
+
+    fun suggestColor(c: Context): Int {
+        val used = usedColors(c, colorMap(c))
+        var i = 0
+        while (i < Palette.size && i in used) i++
+        return if (i >= Palette.size) 0 else i
+    }
+
+    fun colorIndex(c: Context, name: String): Int {
+        val key = name.trim().lowercase()
+        val o = colorMap(c)
+        if (o.has(key)) return o.getInt(key)
+        val used = usedColors(c, o)
+        var i = 0
+        while (i < Palette.size && i in used) i++
+        if (i >= Palette.size) i = o.length() % Palette.size
+        o.put(key, i)
+        prefs(c).edit().putString("colors", o.toString()).apply()
+        return i
+    }
+
+    fun setColorIndex(c: Context, name: String, idx: Int) {
+        val o = colorMap(c)
+        o.put(name.trim().lowercase(), idx)
+        prefs(c).edit().putString("colors", o.toString()).apply()
+    }
+
+    // ----- body measurements (BMI, water goal) -----
+    fun height(c: Context): Float = prefs(c).getFloat("height", 0f)
+    fun weight(c: Context): Float = prefs(c).getFloat("weight", 0f)
+    fun age(c: Context): Int = prefs(c).getInt("age", 0)
+    fun setWeight(c: Context, w: Float) { prefs(c).edit().putFloat("weight", w).apply() }
+    fun setBody(c: Context, h: Float, w: Float, a: Int) {
+        prefs(c).edit().putFloat("height", h).putFloat("weight", w).putInt("age", a).apply()
+    }
+
+    fun weights(c: Context): List<Pair<Long, Double>> {
+        val out = mutableListOf<Pair<Long, Double>>()
+        try {
+            val a = JSONArray(prefs(c).getString("weights", "[]"))
+            for (i in 0 until a.length()) {
+                val o = a.getJSONObject(i)
+                out.add(Pair(o.getLong("t"), o.getDouble("k")))
+            }
+        } catch (_: Exception) {
+        }
+        return out.sortedBy { it.first }
+    }
+
+    fun addWeight(c: Context, kg: Double) {
+        fun dk(t: Long) = dayKey(Calendar.getInstance().apply { timeInMillis = t })
+        val now = System.currentTimeMillis()
+        val l = weights(c).filter { dk(it.first) != dk(now) }.toMutableList()
+        l.add(Pair(now, kg))
+        val a = JSONArray()
+        for ((t, k) in l.takeLast(400)) {
+            val o = JSONObject()
+            o.put("t", t)
+            o.put("k", k)
+            a.put(o)
+        }
+        prefs(c).edit().putString("weights", a.toString()).apply()
+    }
 
     fun feature(c: Context, name: String, default: Boolean): Boolean = prefs(c).getBoolean("feat_$name", default)
     fun setFeature(c: Context, name: String, on: Boolean) { prefs(c).edit().putBoolean("feat_$name", on).apply() }
@@ -275,6 +350,8 @@ fun mealText(i: Int) = when (i) { 0 -> "Empty stomach"; 1 -> "After meal"; else 
 
 class DoseRow(val dateFull: String, val dateLabel: String, val time: Int, val med: String, val dose: String, val meal: Int, val status: String)
 
+class Extra(val title: String, val summary: List<String>, val detail: List<String>)
+
 class ReportData(
     val days: Int,
     val from: String,
@@ -282,7 +359,8 @@ class ReportData(
     val total: Counts,
     val perMed: List<Pair<String, Counts>>,
     val perDay: List<Pair<String, Counts>>,
-    val rows: List<DoseRow>
+    val rows: List<DoseRow>,
+    val extras: List<Extra>
 )
 
 fun buildReport(c: Context, days: Int): ReportData {
@@ -332,7 +410,43 @@ fun buildReport(c: Context, days: Int): ReportData {
         perDay.add(Pair(fmtDay.format(cal.time), dc))
     }
     val byMed = meds.mapNotNull { m -> perMed[m.id]?.let { Pair(m.name, it) } }
-    return ReportData(days, from, to, total, byMed, perDay, rows)
+    val extras = mutableListOf<Extra>()
+    if (Water.on(c)) {
+        val wl = Water.logAll(c)
+        val goal = Water.goal(c)
+        val keys = (0 until days).map { d ->
+            val cal = Calendar.getInstance()
+            cal.add(Calendar.DAY_OF_YEAR, -d)
+            dayKey(cal)
+        }
+        val first = wl.keys.minOrNull()
+        val rel = if (first == null) emptyList() else keys.filter { it >= first }
+        val lines = if (rel.isEmpty()) listOf("No water logged in this period.") else listOf(
+            "Goal met on ${rel.count { (wl[it] ?: 0) >= goal }} of ${rel.size} days",
+            "Average: ${rel.sumOf { wl[it] ?: 0 } / rel.size} ml per day (goal $goal ml)"
+        )
+        extras.add(Extra("Water", lines, emptyList()))
+    }
+    if (Bp.on(c)) {
+        val start = Calendar.getInstance()
+        start.add(Calendar.DAY_OF_YEAR, -(days - 1))
+        start.set(Calendar.HOUR_OF_DAY, 0)
+        start.set(Calendar.MINUTE, 0)
+        start.set(Calendar.SECOND, 0)
+        start.set(Calendar.MILLISECOND, 0)
+        val rs = Bp.all(c).filter { it.time >= start.timeInMillis }
+        val f = java.text.SimpleDateFormat("d MMM, h:mm a", java.util.Locale.getDefault())
+        val sum = if (rs.isEmpty()) listOf("No readings in this period.") else listOf(
+            "Readings: ${rs.size}",
+            "Average: ${Bp.avgText(rs)}",
+            "Highest systolic: ${rs.maxOf { it.sys }}   Lowest systolic: ${rs.minOf { it.sys }}"
+        )
+        val det = rs.takeLast(40).map {
+            "${f.format(java.util.Date(it.time))}   ${it.sys}/${it.dia}" + (if (it.pulse > 0) "   pulse ${it.pulse}" else "") + "   (${Bp.label(it.sys, it.dia).first})"
+        }
+        extras.add(Extra("Blood pressure", sum, det))
+    }
+    return ReportData(days, from, to, total, byMed, perDay, rows, extras)
 }
 
 // ---------- Export: PDF, CSV, plain text ----------
@@ -356,6 +470,12 @@ object Exporter {
         out.add(Pair("", 0))
         out.add(Pair("By day", 1))
         for ((n, x) in r.perDay) if (x.total > 0) out.add(Pair("$n:  Taken ${x.t}, Not taken ${x.s}, Missed ${x.m}", 0))
+        for (e in r.extras) {
+            out.add(Pair("", 0))
+            out.add(Pair(e.title, 1))
+            for (l in e.summary) out.add(Pair(l, 0))
+            if (detail) for (l in e.detail) out.add(Pair(l, 0))
+        }
         if (detail) {
             out.add(Pair("", 0))
             out.add(Pair("All doses", 1))
@@ -517,6 +637,7 @@ object Scheduler {
 
     fun scheduleAll(c: Context) {
         Store.load(c).forEach { schedule(c, it) }
+        HealthAlarms.scheduleAll(c)
     }
 
     fun cancelKind(c: Context, id: Int, idx: Int, kind: Int) {
@@ -583,6 +704,7 @@ class ReminderReceiver : BroadcastReceiver() {
         val code = Scheduler.code(id, idx)
         when (intent.action) {
             Scheduler.TAKEN, Scheduler.SKIP, Scheduler.SNOOZE -> Scheduler.handle(context, intent.action!!, id, idx)
+            HealthAlarms.WATER_FIRE, HealthAlarms.WATER_ADD, HealthAlarms.WATER_SNOOZE, HealthAlarms.BP_FIRE -> HealthAlarms.onReceive(context, intent)
             else -> {
                 val m = Store.load(context).firstOrNull { it.id == id } ?: return
                 if (idx >= m.times.size) return
@@ -609,6 +731,7 @@ class ReminderReceiver : BroadcastReceiver() {
                     val n = Notification.Builder(context, Scheduler.CHANNEL_FOLLOW)
                         .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
                         .setContentTitle("Did you take ${m.name}?")
+                        .setColor(Palette.color(Store.colorIndex(context, m.name)))
                         .setContentText("Scheduled ${fmt12(m.times[idx])} - tap Taken or Not taken")
                         .setCategory(Notification.CATEGORY_REMINDER)
                         .setVisibility(Notification.VISIBILITY_PUBLIC)
@@ -632,6 +755,7 @@ class ReminderReceiver : BroadcastReceiver() {
                 val n = Notification.Builder(context, Scheduler.CHANNEL)
                     .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
                     .setContentTitle(title)
+                    .setColor(Palette.color(Store.colorIndex(context, m.name)))
                     .setContentText(text)
                     .setStyle(Notification.BigTextStyle().bigText("$text\nScheduled ${fmt12(m.times[idx])}"))
                     .setCategory(Notification.CATEGORY_ALARM)
@@ -700,7 +824,32 @@ class AlarmActivity : Activity() {
         val who = Store.name(this)
         text(if (who.isBlank()) "Time for your medicine" else "$who, time for your medicine", 16f)
         text(fmt12(m.times[idx]), 40f, true)
-        text(m.name, 28f, true)
+        val pill = LinearLayout(this)
+        pill.orientation = LinearLayout.HORIZONTAL
+        pill.gravity = Gravity.CENTER_VERTICAL
+        pill.background = GradientDrawable().apply {
+            setColor(Color.WHITE)
+            cornerRadius = dp(24).toFloat()
+        }
+        pill.setPadding(dp(18), dp(8), dp(22), dp(8))
+        val dot = View(this)
+        val dg = GradientDrawable()
+        dg.shape = GradientDrawable.OVAL
+        dg.setColor(Palette.color(Store.colorIndex(this, m.name)))
+        dot.background = dg
+        val dlp = LinearLayout.LayoutParams(dp(16), dp(16))
+        dlp.rightMargin = dp(10)
+        pill.addView(dot, dlp)
+        val pn = TextView(this)
+        pn.text = m.name
+        pn.textSize = 26f
+        pn.setTypeface(null, Typeface.BOLD)
+        pn.setTextColor(Color.parseColor("#12332B"))
+        pill.addView(pn)
+        val plp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        plp.topMargin = dp(6)
+        plp.bottomMargin = dp(6)
+        root.addView(pill, plp)
         val how = when (m.meal) { 0 -> "Empty stomach"; 1 -> "After meal"; else -> "Anytime" }
         text(listOf(m.dose, how).filter { it.isNotBlank() }.joinToString(" • "), 18f)
 
@@ -740,14 +889,14 @@ class MainActivity : Activity() {
     private lateinit var content: LinearLayout
     private lateinit var tabBar: LinearLayout
     private lateinit var subtitle: TextView
-    private var tab = 0
+    private var tab = "Today"
     private var reportDays = 7
     private var askedNotif = false
     private var askedExact = false
     private var askedFs = false
     private val green = Color.parseColor("#147D64")
     private val ink = Color.parseColor("#12332B")
-    private val tabNames = arrayOf("Today", "Medicines", "Report", "Settings")
+    private val gray = Color.parseColor("#6B7F78")
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -756,7 +905,7 @@ class MainActivity : Activity() {
         cornerRadius = dp(r).toFloat()
     }
 
-    private fun tv(t: String, size: Float = 14f, bold: Boolean = false, color: Int = ink): TextView {
+    private fun tv(t: CharSequence, size: Float = 14f, bold: Boolean = false, color: Int = ink): TextView {
         val v = TextView(this)
         v.text = t
         v.textSize = size
@@ -773,18 +922,61 @@ class MainActivity : Activity() {
         return c
     }
 
+    // White card with a coloured stripe on the left. Returns (outer card, inner body).
+    private fun stripeCard(color: Int): Pair<LinearLayout, LinearLayout> {
+        val outer = LinearLayout(this)
+        outer.orientation = LinearLayout.HORIZONTAL
+        outer.background = roundBg(Color.WHITE)
+        outer.clipToOutline = true
+        val bar = View(this)
+        bar.setBackgroundColor(color)
+        outer.addView(bar, LinearLayout.LayoutParams(dp(7), ViewGroup.LayoutParams.MATCH_PARENT))
+        val body = LinearLayout(this)
+        body.orientation = LinearLayout.VERTICAL
+        body.setPadding(dp(14), dp(10), dp(14), dp(10))
+        outer.addView(body, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        return Pair(outer, body)
+    }
+
+    private fun colored(prefix: String, rest: String, color: Int): SpannableString {
+        val s = SpannableString(prefix + rest)
+        s.setSpan(ForegroundColorSpan(color), 0, prefix.length, 0)
+        return s
+    }
+
     private fun add(v: View, top: Int = 10) {
         val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         lp.topMargin = dp(top)
         content.addView(v, lp)
     }
 
-    private fun mealLabel(i: Int) = when (i) { 0 -> "Empty stomach"; 1 -> "After meal"; else -> "Anytime" }
+    private fun button(label: String, onClick: () -> Unit): Button {
+        val b = Button(this)
+        b.text = label
+        b.isAllCaps = false
+        b.setOnClickListener { onClick() }
+        return b
+    }
+
+    private fun numberField(hint: String, value: String, decimal: Boolean = false): EditText {
+        val e = EditText(this)
+        e.hint = hint
+        e.setSingleLine()
+        e.inputType = InputType.TYPE_CLASS_NUMBER or (if (decimal) InputType.TYPE_NUMBER_FLAG_DECIMAL else 0)
+        e.setText(value)
+        return e
+    }
+
+    private fun num(e: EditText): Double? = e.text.toString().trim().toDoubleOrNull()
+
+    private fun mealLabel(i: Int) = mealText(i)
     private fun freqLabel(n: Int) = when (n) { 1 -> "Once a day"; 2 -> "Twice a day"; 3 -> "3 times a day"; else -> "4 times a day" }
+    private fun medColor(name: String) = Palette.color(Store.colorIndex(this, name))
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Scheduler.ensureChannel(this)
+        tab = intent.getStringExtra("tab") ?: "Today"
 
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -826,18 +1018,6 @@ class MainActivity : Activity() {
         tabBar = LinearLayout(this)
         tabBar.orientation = LinearLayout.HORIZONTAL
         tabBar.setBackgroundColor(Color.WHITE)
-        for (i in tabNames.indices) {
-            val t = TextView(this)
-            t.text = tabNames[i]
-            t.textSize = 14f
-            t.gravity = Gravity.CENTER
-            t.setPadding(0, dp(14), 0, dp(14))
-            t.setOnClickListener {
-                tab = i
-                render()
-            }
-            tabBar.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        }
         body.addView(tabBar)
 
         root.addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
@@ -851,30 +1031,53 @@ class MainActivity : Activity() {
         render()
         Scheduler.scheduleAll(this)
         checkSetup()
+        if (Updater.enabled(this) && Updater.dueForCheck(this)) {
+            Updater.check(this) { _, _ -> runOnUiThread { if (!isFinishing) render() } }
+        }
+    }
+
+    private fun tabs(): List<String> {
+        val l = mutableListOf("Today", "Medicines", "Report")
+        if (Bp.on(this) || Store.feature(this, "bmi", false)) l.add("Health")
+        l.add("Settings")
+        return l
     }
 
     private fun render() {
         val who = Store.name(this)
         subtitle.text = if (who.isBlank()) "Take care of your health" else "Hello, $who"
-        for (i in 0 until tabBar.childCount) {
-            val t = tabBar.getChildAt(i) as TextView
-            t.setTextColor(if (i == tab) green else Color.GRAY)
-            t.setTypeface(null, if (i == tab) Typeface.BOLD else Typeface.NORMAL)
+        val names = tabs()
+        if (tab !in names) tab = "Today"
+        tabBar.removeAllViews()
+        for (n in names) {
+            val t = TextView(this)
+            t.text = n
+            t.textSize = 14f
+            t.gravity = Gravity.CENTER
+            t.setPadding(0, dp(14), 0, dp(14))
+            t.setTextColor(if (n == tab) green else Color.GRAY)
+            t.setTypeface(null, if (n == tab) Typeface.BOLD else Typeface.NORMAL)
+            t.setOnClickListener {
+                tab = n
+                render()
+            }
+            tabBar.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
         content.removeAllViews()
         when (tab) {
-            0 -> renderToday()
-            1 -> renderMeds()
-            2 -> renderReport()
+            "Today" -> renderToday()
+            "Medicines" -> renderMeds()
+            "Report" -> renderReport()
+            "Health" -> renderHealth()
             else -> renderSettings()
         }
     }
 
-    // ----- First-run notice -----
+    // ----- First-run notice and name -----
     private fun showNotice() {
         AlertDialog.Builder(this)
             .setTitle("Before you start")
-            .setMessage("Medicine Reminder is a reminder and personal log. It is not medical advice and does not replace your doctor or pharmacist. Always follow your doctor's instructions for your medicines.\n\nYour data stays on this phone.")
+            .setMessage("Medicine Reminder is a reminder and personal log. It is not medical advice and does not replace your doctor or pharmacist. Always follow your doctor's instructions for your medicines.\n\nYour health data stays on this phone.")
             .setCancelable(false)
             .setPositiveButton("I understand") { _, _ ->
                 Store.setNoticeSeen(this)
@@ -883,7 +1086,6 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // ----- Name -----
     private fun askName() {
         val e = EditText(this)
         e.hint = "Your name"
@@ -904,12 +1106,25 @@ class MainActivity : Activity() {
 
     // ----- Today -----
     private fun addFooter() {
-        val f = tv("Conceptualized & Designed by Faiz Anwar", 12f, false, Color.parseColor("#6B7F78"))
+        val f = tv("Conceptualized & Designed by Faiz Anwar", 12f, false, gray)
         f.gravity = Gravity.CENTER
         add(f, 24)
     }
 
     private fun renderToday() {
+        Updater.pending(this)?.let { (name, url) ->
+            val u = card()
+            u.background = roundBg(Color.parseColor("#FFF3D6"))
+            u.addView(tv("New version $name available", 15f, true))
+            u.addView(tv("Tap to download", 13f, false, gray))
+            u.setOnClickListener {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                } catch (_: Exception) {
+                }
+            }
+            add(u, 8)
+        }
         if (Store.feature(this, "quote", true)) {
             val q = card()
             q.background = roundBg(Color.parseColor("#E3F2EC"))
@@ -917,6 +1132,8 @@ class MainActivity : Activity() {
             q.addView(tv(Quotes.today(), 15f))
             add(q, 8)
         }
+        if (Water.on(this)) renderWaterCard()
+
         val meds = Store.load(this)
         val key = todayKey()
         val log = Store.log(this)
@@ -937,17 +1154,19 @@ class MainActivity : Activity() {
         add(tv("Tap a dose to mark it taken or not taken.", 13f, false, Color.GRAY), 2)
         for ((t, m, i) in doses) {
             val st = log["$key:${m.id}:$i"]
-            val c = card()
-            c.addView(tv("${fmt12(t)}   ${m.name}" + if (m.dose.isNotBlank()) "  (${m.dose})" else "", 17f, true))
+            val col = medColor(m.name)
+            val (outer, c) = stripeCard(col)
+            val title = tv(colored("● ${fmt12(t)}", "   ${m.name}" + if (m.dose.isNotBlank()) "  (${m.dose})" else "", col), 17f, true)
+            c.addView(title)
             c.addView(tv(mealLabel(m.meal), 13f, false, Color.GRAY))
-            val (label, col) = when {
+            val (label, scol) = when {
                 st == "T" -> Pair("✓ Taken", "#1B8A5A")
                 st == "S" -> Pair("✗ Not taken", "#B23B3B")
                 t > now -> Pair("Upcoming", "#666666")
                 else -> Pair("! Not marked - tap to update", "#C98A12")
             }
-            c.addView(tv(label, 15f, true, Color.parseColor(col)))
-            c.setOnClickListener {
+            c.addView(tv(label, 15f, true, Color.parseColor(scol)))
+            outer.setOnClickListener {
                 AlertDialog.Builder(this)
                     .setTitle("${m.name} - ${fmt12(t)}")
                     .setItems(arrayOf("Mark as taken", "Mark as not taken", "Clear mark")) { _, w ->
@@ -961,18 +1180,64 @@ class MainActivity : Activity() {
                     .setNegativeButton("Cancel", null)
                     .show()
             }
-            add(c)
+            add(outer)
         }
         addFooter()
     }
 
+    private fun renderWaterCard() {
+        val goal = Water.goal(this)
+        val glass = Water.glass(this)
+        val ml = Water.today(this)
+        val blue = Color.parseColor("#2F6FDB")
+        val c = card()
+        c.addView(tv("Water", 16f, true, blue))
+        c.addView(tv(String.format("%,d ml of %,d ml", ml, goal) + if (ml >= goal) "   Goal reached!" else "", 15f))
+        val pct = minOf(100, ml * 100 / maxOf(goal, 1))
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.background = roundBg(Color.parseColor("#DDE7F5"), 6)
+        val fill = View(this)
+        fill.background = roundBg(blue, 6)
+        bar.addView(fill, LinearLayout.LayoutParams(0, dp(12), pct.toFloat()))
+        bar.addView(View(this), LinearLayout.LayoutParams(0, dp(12), (100 - pct).toFloat()))
+        val blp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(12))
+        blp.topMargin = dp(8)
+        c.addView(bar, blp)
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        fun rb(label: String, f: () -> Unit) {
+            row.addView(button(label, f), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        rb("+ $glass ml") {
+            Water.add(this, glass)
+            render()
+        }
+        rb("Undo") {
+            Water.add(this, -glass)
+            render()
+        }
+        rb("Other...") {
+            val e = numberField("Amount in ml", "")
+            val p = LinearLayout(this)
+            p.setPadding(dp(20), dp(8), dp(20), 0)
+            p.addView(e, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            AlertDialog.Builder(this).setTitle("Add water").setView(p)
+                .setPositiveButton("Add") { _, _ ->
+                    val v = num(e)
+                    if (v != null && v > 0 && v <= 3000) {
+                        Water.add(this, v.toInt())
+                        render()
+                    }
+                }.setNegativeButton("Cancel", null).show()
+        }
+        c.addView(row)
+        add(c, 8)
+    }
+
     // ----- Medicines -----
     private fun renderMeds() {
-        val b = Button(this)
-        b.text = "+ Add medicine"
-        b.isAllCaps = false
-        b.setOnClickListener { showForm(null) }
-        add(b, 8)
+        add(button("+ Add medicine") { showForm(null) }, 8)
         val meds = Store.load(this).sortedBy { it.times.minOrNull() ?: 0 }
         if (meds.isEmpty()) {
             val t = tv("No medicines yet.", 16f)
@@ -983,12 +1248,13 @@ class MainActivity : Activity() {
         }
         add(tv("Tap a medicine to edit or delete it.", 13f, false, Color.GRAY), 2)
         for (m in meds) {
-            val c = card()
-            c.addView(tv(m.name + if (m.dose.isNotBlank()) "  (${m.dose})" else "", 18f, true))
+            val col = medColor(m.name)
+            val (outer, c) = stripeCard(col)
+            c.addView(tv(colored("● ", m.name + if (m.dose.isNotBlank()) "  (${m.dose})" else "", col), 18f, true))
             c.addView(tv(mealLabel(m.meal) + " • " + freqLabel(m.times.size), 14f))
-            c.addView(tv(m.times.sorted().joinToString("   ") { fmt12(it) }, 16f, false, green))
-            c.setOnClickListener { showManage(m) }
-            add(c)
+            c.addView(tv(m.times.sorted().joinToString("   ") { fmt12(it) }, 16f, false, col))
+            outer.setOnClickListener { showManage(m) }
+            add(outer)
         }
     }
 
@@ -1011,6 +1277,7 @@ class MainActivity : Activity() {
                         val all = Store.load(this)
                         all.removeAll { it.id == m.id }
                         Store.save(this, all)
+                        HealthAlarms.scheduleAll(this)
                         render()
                     }
                     .setNegativeButton("Cancel", null)
@@ -1025,14 +1292,11 @@ class MainActivity : Activity() {
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
         for ((label, days) in listOf(Pair("7 days", 7), Pair("30 days", 30), Pair("90 days", 90))) {
-            val b = Button(this)
-            b.text = label
-            b.isAllCaps = false
-            b.alpha = if (reportDays == days) 1f else 0.5f
-            b.setOnClickListener {
+            val b = button(label) {
                 reportDays = days
                 render()
             }
+            b.alpha = if (reportDays == days) 1f else 0.5f
             row.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
         add(row, 8)
@@ -1047,23 +1311,27 @@ class MainActivity : Activity() {
         sum.addView(tv("! Missed (no answer): ${total.m}", 16f, false, Color.parseColor("#C98A12")))
         add(sum)
 
+        for (e in r.extras) {
+            val ec = card()
+            ec.addView(tv(e.title, 16f, true))
+            for (l in e.summary) ec.addView(tv(l, 14f))
+            add(ec)
+        }
+
         if (total.total == 0) {
-            add(tv("No records yet. The report fills up as you mark your doses.", 14f, false, Color.GRAY))
+            add(tv("No dose records yet. The report fills up as you mark your doses.", 14f, false, Color.GRAY))
             return
         }
 
-        val ex = Button(this)
-        ex.text = "Export / Share report"
-        ex.isAllCaps = false
-        ex.setOnClickListener { showExport() }
-        add(ex)
+        add(button("Export / Share report") { showExport() })
 
         add(tv("By medicine", 16f, true), 12)
         for ((name, c) in r.perMed) {
-            val card = card()
-            card.addView(tv(name, 16f, true))
-            card.addView(tv("✓ ${c.t}    ✗ ${c.s}    ! ${c.m}", 15f))
-            add(card, 6)
+            val col = medColor(name)
+            val (outer, body) = stripeCard(col)
+            body.addView(tv(colored("● ", name, col), 16f, true))
+            body.addView(tv("✓ ${c.t}    ✗ ${c.s}    ! ${c.m}", 15f))
+            add(outer, 6)
         }
 
         add(tv("By day", 16f, true), 16)
@@ -1113,6 +1381,193 @@ class MainActivity : Activity() {
         Toast.makeText(this, "This report contains health information. Share it carefully.", Toast.LENGTH_LONG).show()
     }
 
+    // ----- Health tab: blood pressure and BMI -----
+    private fun renderHealth() {
+        if (Bp.on(this)) renderBp()
+        if (Store.feature(this, "bmi", false)) renderBmi()
+    }
+
+    private fun fmtDT(t: Long) = java.text.SimpleDateFormat("d MMM, h:mm a", java.util.Locale.getDefault()).format(java.util.Date(t))
+
+    private fun renderBp() {
+        val all = Bp.all(this)
+        val c = card()
+        c.addView(tv("Blood pressure", 16f, true, Color.parseColor("#B23B3B")))
+        if (all.isEmpty()) {
+            c.addView(tv("No readings yet.", 14f, false, gray))
+        } else {
+            val last = all.last()
+            val (lab, col) = Bp.label(last.sys, last.dia)
+            c.addView(tv("${last.sys}/${last.dia} mmHg" + if (last.pulse > 0) "   •   pulse ${last.pulse}" else "", 22f, true))
+            c.addView(tv(lab, 15f, true, Color.parseColor(col)))
+            c.addView(tv(fmtDT(last.time), 12f, false, gray))
+            if (last.sys > 180 || last.dia > 120) {
+                c.addView(tv("Rest for 5 minutes and measure again. If it stays this high, or you have chest pain, breathlessness, weakness, a severe headache or trouble speaking or seeing, get urgent medical help.", 13f, false, Color.parseColor("#8B1A1A")))
+            } else if (last.sys < 90 || last.dia < 60) {
+                c.addView(tv("If you feel dizzy or faint, talk to your doctor.", 13f, false, gray))
+            }
+            if (last.pulse > 0 && (last.pulse < 50 || last.pulse > 100)) {
+                c.addView(tv("Pulse is outside the usual resting range of about 60-100.", 13f, false, gray))
+            }
+        }
+        c.addView(button("+ Add reading") { showAddBp() })
+        add(c, 8)
+
+        if (all.size >= 2) {
+            val chart = card()
+            chart.addView(tv("Recent readings", 14f, true))
+            chart.addView(BpChart(this, all.takeLast(20)), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(170)))
+            add(chart)
+            val now = System.currentTimeMillis()
+            val a = card()
+            a.addView(tv("Averages", 14f, true))
+            a.addView(tv("Last 7 days: " + Bp.avgText(all.filter { it.time >= now - 7 * 86400000L }), 14f))
+            a.addView(tv("Last 30 days: " + Bp.avgText(all.filter { it.time >= now - 30 * 86400000L }), 14f))
+            add(a)
+        }
+        if (all.isNotEmpty()) {
+            val h = card()
+            h.addView(tv("History (tap to delete)", 14f, true))
+            for (r in all.reversed().take(10)) {
+                val (_, col) = Bp.label(r.sys, r.dia)
+                val line = tv(colored("● ", "${fmtDT(r.time)}   ${r.sys}/${r.dia}" + (if (r.pulse > 0) "   p ${r.pulse}" else "") + (if (r.note.isNotBlank()) "   ${r.note}" else ""), Color.parseColor(col)), 14f)
+                line.setPadding(0, dp(6), 0, dp(6))
+                line.setOnClickListener {
+                    AlertDialog.Builder(this).setTitle("Delete this reading?")
+                        .setMessage("${fmtDT(r.time)}   ${r.sys}/${r.dia}")
+                        .setPositiveButton("Delete") { _, _ ->
+                            Bp.remove(this, r.time)
+                            render()
+                        }.setNegativeButton("Cancel", null).show()
+                }
+                h.addView(line)
+            }
+            add(h)
+        }
+        add(tv("Ranges follow common adult guidance (AHA/ACC). Your doctor may set different targets for you. This log does not diagnose anything.", 12f, false, gray), 6)
+    }
+
+    private fun showAddBp() {
+        val p = LinearLayout(this)
+        p.orientation = LinearLayout.VERTICAL
+        p.setPadding(dp(20), dp(8), dp(20), 0)
+        p.addView(tv("Sit quietly for 5 minutes before measuring.", 13f, false, gray))
+        val s = numberField("Systolic (upper number)", "")
+        val d = numberField("Diastolic (lower number)", "")
+        val pu = numberField("Pulse (optional)", "")
+        val n = EditText(this)
+        n.hint = "Note (optional), e.g. after medicine"
+        n.setSingleLine()
+        p.addView(s)
+        p.addView(d)
+        p.addView(pu)
+        p.addView(n)
+        val dlg = AlertDialog.Builder(this).setTitle("Add BP reading").setView(p)
+            .setPositiveButton("Save", null).setNegativeButton("Cancel", null).create()
+        dlg.show()
+        dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val sv = num(s)?.toInt()
+            val dv = num(d)?.toInt()
+            val pv = num(pu)?.toInt() ?: 0
+            if (sv == null || dv == null || sv !in 50..300 || dv !in 30..200 || dv >= sv || (pv != 0 && pv !in 20..250)) {
+                Toast.makeText(this, "Please check the numbers", Toast.LENGTH_SHORT).show()
+            } else {
+                Bp.add(this, BpReading(System.currentTimeMillis(), sv, dv, pv, n.text.toString().trim()))
+                dlg.dismiss()
+                render()
+                if (sv > 180 || dv > 120) {
+                    AlertDialog.Builder(this).setTitle("Very high reading")
+                        .setMessage("Rest for 5 minutes and measure again. If it stays this high, or you have chest pain, breathlessness, weakness, a severe headache or trouble speaking or seeing, get urgent medical help.")
+                        .setPositiveButton("OK", null).show()
+                }
+            }
+        }
+    }
+
+    private fun renderBmi() {
+        val c = card()
+        c.addView(tv("BMI and ideal weight", 16f, true, green))
+        val h = numberField("Height (cm)", Store.height(this).let { if (it > 0) it.toInt().toString() else "" })
+        val w = numberField("Weight (kg)", Store.weight(this).let { if (it > 0) String.format("%.1f", it.toDouble()) else "" }, true)
+        val a = numberField("Age (years)", Store.age(this).let { if (it > 0) it.toString() else "" })
+        c.addView(h)
+        c.addView(w)
+        c.addView(a)
+        val sw = Switch(this)
+        sw.text = "Use Asian cut-offs (recommended for India)"
+        sw.isChecked = Bmi.asian(this)
+        sw.setOnCheckedChangeListener { _, on ->
+            Store.setFeature(this, "bmi_asian", on)
+            render()
+        }
+        c.addView(sw)
+        c.addView(button("Calculate and save") {
+            val hv = num(h)
+            val wv = num(w)
+            val av = num(a)?.toInt() ?: 0
+            if (hv == null || wv == null || hv !in 100.0..230.0 || wv !in 20.0..300.0 || (av != 0 && av !in 5..110)) {
+                Toast.makeText(this, "Please check height, weight and age", Toast.LENGTH_SHORT).show()
+            } else {
+                Store.setBody(this, hv.toFloat(), wv.toFloat(), av)
+                Store.addWeight(this, wv)
+                render()
+            }
+        })
+        add(c, 8)
+
+        val hv = Store.height(this).toDouble()
+        val wv = Store.weight(this).toDouble()
+        if (hv <= 0 || wv <= 0) return
+        val age = Store.age(this)
+        val r = card()
+        if (age in 1..17) {
+            r.addView(tv("BMI for children and teens is judged on growth charts, not these cut-offs. Please ask your doctor.", 14f))
+            add(r)
+            return
+        }
+        val asian = Bmi.asian(this)
+        val bmi = Bmi.value(wv, hv)
+        val (lo, hi) = Bmi.range(hv, asian)
+        r.addView(tv(String.format("BMI %.1f", bmi) + "  -  " + Bmi.category(bmi, asian), 20f, true))
+        r.addView(tv(String.format("Healthy weight for your height: %.1f - %.1f kg", lo, hi), 15f))
+        when {
+            wv > hi -> {
+                val over = wv - hi
+                val wkMin = Math.ceil(over / 0.5).toInt()
+                val wkMax = Math.ceil(over / 0.25).toInt()
+                r.addView(tv(String.format("You are %.1f kg above the top of this range.", over), 15f, true, Color.parseColor("#C98A12")))
+                r.addView(tv("A safe pace is about 0.25-0.5 kg a week, so roughly $wkMin-$wkMax weeks. Slow and steady lasts longer.", 14f))
+                r.addView(tv("Ideas that help:", 14f, true))
+                for (t in listOf(
+                    "Smaller portions, eaten slowly. Stop when comfortably full.",
+                    "Swap sugary drinks and sweets for water, buttermilk or fruit.",
+                    "Fill half your plate with vegetables; add protein and fibre (dal, curd, eggs, sprouts).",
+                    "Walk about 30 minutes on most days (150 minutes a week) and build up slowly.",
+                    "Sleep 7-8 hours; poor sleep makes hunger harder to control.",
+                    "Weigh yourself once a week, at the same time of day.",
+                    "Avoid crash diets and fat-burner pills."
+                )) r.addView(tv("•  $t", 14f))
+            }
+            wv < lo -> {
+                r.addView(tv(String.format("You are %.1f kg below this range.", lo - wv), 15f, true, Color.parseColor("#2F6FDB")))
+                r.addView(tv("Regular, nutritious meals matter. If this is not usual for you, or you are losing weight without trying, please talk to your doctor.", 14f))
+            }
+            else -> r.addView(tv("You are in the healthy range. Keep up your routine.", 15f, true, Color.parseColor("#1B8A5A")))
+        }
+        r.addView(tv(
+            if (asian) "Asian cut-offs: healthy 18.5-22.9, overweight 23-24.9, obese 25 and above."
+            else "International cut-offs: healthy 18.5-24.9, overweight 25-29.9, obese 30 and above.", 12f, false, gray
+        ))
+        val ws = Store.weights(this)
+        if (ws.size >= 2) {
+            r.addView(tv("Weight history", 14f, true))
+            val f = java.text.SimpleDateFormat("d MMM", java.util.Locale.getDefault())
+            for ((t, kg) in ws.takeLast(5).reversed()) r.addView(tv("${f.format(java.util.Date(t))}:  ${String.format("%.1f", kg)} kg", 14f))
+        }
+        r.addView(tv("BMI is only a rough guide. It can mislead for athletes, older adults, children and during pregnancy. If you have a medical condition or take regular medicines, check with your doctor before changing diet or exercise. This is not medical advice.", 12f, false, gray))
+        add(r)
+    }
+
     // ----- Settings -----
     private fun renderSettings() {
         val nameCard = card()
@@ -1122,55 +1577,171 @@ class MainActivity : Activity() {
         e.setSingleLine()
         e.setText(Store.name(this))
         nameCard.addView(e)
-        val save = Button(this)
-        save.text = "Save name"
-        save.isAllCaps = false
-        save.setOnClickListener {
+        nameCard.addView(button("Save name") {
             Store.setName(this, e.text.toString())
             Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()
             render()
-        }
-        nameCard.addView(save)
+        })
         add(nameCard, 8)
 
         val meals = Store.meals(this)
         val mc = card()
         mc.addView(tv("Meal times", 16f, true))
         mc.addView(tv("Breakfast ${fmt12(meals[0])}  •  Lunch ${fmt12(meals[1])}  •  Dinner ${fmt12(meals[2])}", 14f))
-        val mb = Button(this)
-        mb.text = "Change meal times"
-        mb.isAllCaps = false
-        mb.setOnClickListener { showMealTimes() }
-        mc.addView(mb)
+        mc.addView(button("Change meal times") { showMealTimes() })
         add(mc)
+
+        // Optional features
+        val fc = card()
+        fc.addView(tv("Features (turn on only what you want)", 16f, true))
+        fun feature(label: String, key: String, def: Boolean, after: () -> Unit = {}) {
+            val sw = Switch(this)
+            sw.text = label
+            sw.isChecked = Store.feature(this, key, def)
+            sw.setPadding(0, dp(8), 0, dp(8))
+            sw.setOnCheckedChangeListener { _, on ->
+                Store.setFeature(this, key, on)
+                after()
+                HealthAlarms.scheduleAll(this)
+                render()
+            }
+            fc.addView(sw)
+        }
+        feature("Daily health quote", "quote", true)
+        feature("Water reminders", "water", false)
+        feature("Blood pressure tracker", "bp", false)
+        feature("BMI and ideal weight", "bmi", false)
+        feature("Check for app updates (uses internet)", "updatecheck", true)
+        fc.addView(tv("Coming next: step counter.", 12f, false, gray))
+        add(fc)
+
+        if (Water.on(this)) addWaterSettings()
+        if (Bp.on(this)) addBpSettings()
+
+        val uc = card()
+        uc.addView(tv("App version", 16f, true))
+        uc.addView(tv("Installed: v${Updater.installedName(this)}", 14f))
+        uc.addView(button("Check for updates now") {
+            Toast.makeText(this, "Checking...", Toast.LENGTH_SHORT).show()
+            Updater.check(this) { _, msg ->
+                runOnUiThread {
+                    Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                    render()
+                }
+            }
+        })
+        add(uc)
 
         val rc = card()
         rc.addView(tv("Reliability", 16f, true))
         rc.addView(tv("Make sure reminders ring on a locked phone.", 14f))
-        val rb = Button(this)
-        rb.text = "Check settings"
-        rb.isAllCaps = false
-        rb.setOnClickListener { showReliability() }
-        rc.addView(rb)
+        rc.addView(button("Check settings") { showReliability() })
         add(rc)
-
-        val fc = card()
-        fc.addView(tv("Features", 16f, true))
-        val sw = Switch(this)
-        sw.text = "Daily health quote on Today screen"
-        sw.isChecked = Store.feature(this, "quote", true)
-        sw.setOnCheckedChangeListener { _, on -> Store.setFeature(this, "quote", on) }
-        fc.addView(sw)
-        fc.addView(tv("More options (water, blood pressure, BMI) are coming in the next update.", 12f, false, Color.GRAY))
-        add(fc)
 
         val ab = card()
         ab.addView(tv("About", 16f, true))
-        ab.addView(tv("Medicine Reminder v1.4", 13f, false, Color.GRAY))
+        ab.addView(tv("Medicine Reminder v${Updater.installedName(this)}", 13f, false, Color.GRAY))
         ab.addView(tv("Conceptualized & Designed by", 14f))
         ab.addView(tv("Faiz Anwar", 18f, true, green))
-        ab.addView(tv("A reminder and personal log. Not medical advice; it does not replace your doctor or pharmacist. Your data stays on this phone.", 12f, false, Color.GRAY))
+        ab.addView(tv("A reminder and personal log. Not medical advice; it does not replace your doctor or pharmacist. Your health data stays on this phone. The internet is used only to check for new versions, if you leave that switch on.", 12f, false, Color.GRAY))
         add(ab)
+    }
+
+    private fun addWaterSettings() {
+        val c = card()
+        c.addView(tv("Water settings", 16f, true, Color.parseColor("#2F6FDB")))
+        val savedW = Store.weight(this)
+        val weight = numberField("Weight (kg) - to suggest a goal", if (savedW > 0) String.format("%.0f", savedW.toDouble()) else "", true)
+        val goal = numberField("Daily goal (ml)", Water.goal(this).toString())
+        val glass = numberField("Glass size (ml) - 250 is common, or your own", Water.glass(this).toString())
+        c.addView(weight)
+        c.addView(button("Suggest goal from weight") {
+            val kg = num(weight)
+            if (kg != null && kg in 20.0..300.0) goal.setText((Math.round(kg * 33 / 50.0) * 50).toString())
+            else Toast.makeText(this, "Enter your weight first", Toast.LENGTH_SHORT).show()
+        })
+        c.addView(goal)
+        c.addView(glass)
+        c.addView(tv("A common guide is about 30-35 ml per kg a day. Heat, exercise and illness raise it. If you have a kidney, heart or liver condition, or your doctor limits fluids, use your doctor's number.", 12f, false, gray))
+
+        c.addView(tv("Reminder style", 14f, true))
+        val rg = RadioGroup(this)
+        val r0 = RadioButton(this)
+        r0.text = "Every 2 hours"
+        r0.id = 1001
+        val r1 = RadioButton(this)
+        r1.text = "Spread through the day to match my goal"
+        r1.id = 1002
+        rg.addView(r0)
+        rg.addView(r1)
+        rg.check(if (Water.mode(this) == 0) 1001 else 1002)
+        c.addView(rg)
+
+        var wake = Water.wake(this)
+        var sleep = Water.sleep(this)
+        val wb = Button(this)
+        wb.isAllCaps = false
+        wb.text = "Wake time: ${fmt12(wake)}"
+        wb.setOnClickListener {
+            TimePickerDialog(this, { _, h, m ->
+                wake = h * 60 + m
+                wb.text = "Wake time: ${fmt12(wake)}"
+            }, wake / 60, wake % 60, false).show()
+        }
+        val sb = Button(this)
+        sb.isAllCaps = false
+        sb.text = "Sleep time: ${fmt12(sleep)}"
+        sb.setOnClickListener {
+            TimePickerDialog(this, { _, h, m ->
+                sleep = h * 60 + m
+                sb.text = "Sleep time: ${fmt12(sleep)}"
+            }, sleep / 60, sleep % 60, false).show()
+        }
+        c.addView(wb)
+        c.addView(sb)
+        c.addView(button("Save water settings") {
+            val gv = num(goal)?.toInt()
+            val sv = num(glass)?.toInt()
+            if (gv == null || sv == null || gv !in 500..6000 || sv !in 50..1000 || sleep <= wake + 120) {
+                Toast.makeText(this, "Please check the numbers and times", Toast.LENGTH_LONG).show()
+            } else {
+                Water.saveSettings(this, gv, sv, if (rg.checkedRadioButtonId == 1001) 0 else 1, wake, sleep)
+                val kg = num(weight)
+                if (kg != null && kg in 20.0..300.0) Store.setWeight(this, kg.toFloat())
+                HealthAlarms.scheduleAll(this)
+                Toast.makeText(this, "Saved. ${Water.slots(this).size} reminders a day.", Toast.LENGTH_LONG).show()
+                render()
+            }
+        })
+        add(c)
+    }
+
+    private fun addBpSettings() {
+        val c = card()
+        c.addView(tv("Blood pressure reminders", 16f, true, Color.parseColor("#B23B3B")))
+        val sw = Switch(this)
+        sw.text = "Remind me to measure BP"
+        sw.isChecked = Bp.remind(this)
+        sw.setOnCheckedChangeListener { _, on ->
+            Store.setFeature(this, "bp_remind", on)
+            HealthAlarms.scheduleAll(this)
+        }
+        c.addView(sw)
+        for (i in 0..1) {
+            val b = Button(this)
+            b.isAllCaps = false
+            b.text = "Reminder ${i + 1}: ${fmt12(Bp.time(this, i))}"
+            b.setOnClickListener {
+                val t = Bp.time(this, i)
+                TimePickerDialog(this, { _, h, m ->
+                    Bp.setTime(this, i, h * 60 + m)
+                    HealthAlarms.scheduleAll(this)
+                    b.text = "Reminder ${i + 1}: ${fmt12(h * 60 + m)}"
+                }, t / 60, t % 60, false).show()
+            }
+            c.addView(b)
+        }
+        add(c)
     }
 
     // ----- Permissions -----
@@ -1200,8 +1771,8 @@ class MainActivity : Activity() {
         checkSetup()
     }
 
-    // ----- Add / edit -----
-    // Step 1: name, dose, meal rule, how many times a day.
+    // ----- Add / edit medicine -----
+    // Step 1: name, dose, meal rule, how many times a day, colour.
     private fun showForm(existing: Med?) {
         val p = LinearLayout(this)
         p.orientation = LinearLayout.VERTICAL
@@ -1225,6 +1796,40 @@ class MainActivity : Activity() {
         p.addView(meal)
         p.addView(freq)
 
+        // Colour: automatic, but you can pick another one.
+        var sel = if (existing != null) Store.colorIndex(this, existing.name) else Store.suggestColor(this)
+        var touched = false
+        p.addView(tv("Colour", 13f, false, gray))
+        val circles = mutableListOf<View>()
+        fun paint() {
+            circles.forEachIndexed { i, v ->
+                val g = GradientDrawable()
+                g.shape = GradientDrawable.OVAL
+                g.setColor(Palette.color(i))
+                if (i == sel) g.setStroke(dp(3), ink)
+                v.background = g
+            }
+        }
+        var rowL: LinearLayout? = null
+        for (i in 0 until Palette.size) {
+            if (i % 5 == 0) {
+                rowL = LinearLayout(this)
+                rowL.orientation = LinearLayout.HORIZONTAL
+                p.addView(rowL)
+            }
+            val v = View(this)
+            val lp = LinearLayout.LayoutParams(dp(34), dp(34))
+            lp.setMargins(0, dp(6), dp(10), dp(6))
+            v.setOnClickListener {
+                sel = i
+                touched = true
+                paint()
+            }
+            rowL!!.addView(v, lp)
+            circles.add(v)
+        }
+        paint()
+
         val d = AlertDialog.Builder(this)
             .setTitle(if (existing == null) "Add medicine" else "Edit medicine")
             .setView(p)
@@ -1238,13 +1843,13 @@ class MainActivity : Activity() {
                 Toast.makeText(this, "Enter the medicine name", Toast.LENGTH_SHORT).show()
             } else {
                 d.dismiss()
-                showTimes(existing, n, dose.text.toString().trim(), meal.selectedItemPosition, freq.selectedItemPosition + 1)
+                showTimes(existing, n, dose.text.toString().trim(), meal.selectedItemPosition, freq.selectedItemPosition + 1, if (touched || existing != null) sel else -1)
             }
         }
     }
 
     // Step 2: suggested times, each one editable.
-    private fun showTimes(existing: Med?, name: String, dose: String, meal: Int, freq: Int) {
+    private fun showTimes(existing: Med?, name: String, dose: String, meal: Int, freq: Int, color: Int) {
         val others = Store.load(this).filter { it.id != existing?.id }.flatMap { it.times }
         val times: MutableList<Int> =
             if (existing != null && existing.meal == meal && existing.times.size == freq) existing.times.toMutableList()
@@ -1294,7 +1899,9 @@ class MainActivity : Activity() {
                 all.removeAll { it.id == med.id }
                 all.add(med)
                 Store.save(this, all)
+                if (color >= 0) Store.setColorIndex(this, name, color) else Store.colorIndex(this, name)
                 Scheduler.schedule(this, med)
+                HealthAlarms.scheduleAll(this)
                 val close = others.any { o -> med.times.any { Suggest.dist(o, it) < Suggest.GAP } }
                 if (close) Toast.makeText(this, "Note: a time is close to another medicine", Toast.LENGTH_LONG).show()
                 render()
